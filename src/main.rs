@@ -1,10 +1,18 @@
-use std::time::Duration;
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use std::{sync::Mutex, time::Duration};
+
+use rayon::prelude::*;
 
 use board_game_traits::{GameResult, Position as PositionTrait};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pgn_traits::PgnPosition;
-use sqlx::{Connection, Executor, SqliteConnection, Row};
+use sqlx::{Connection, Executor, Row, SqliteConnection};
 use tiltak::position::{self, Komi, Move, Position};
+use tiltak::search;
+use topaz_tak::GameMove;
+use topaz_tak::board::Board6;
 
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
@@ -15,40 +23,66 @@ async fn main() -> Result<(), sqlx::Error> {
     let mut conn = SqliteConnection::connect("sqlite:games_anon.db").await?;
     let games = read_non_bot_games(&mut conn).await.unwrap();
 
-    let mut num_games = 0;
-    let mut num_bot_games = 0;
-    let mut num_illegal = 0;
-    let mut num_non_standard_piececounts = 0;
-    let mut num_wrong_size = 0;
+    let times = Mutex::new(BTreeSet::new());
+    let time_sum = Mutex::new(Duration::ZERO);
+    let games_processed = AtomicU64::new(0);
+    let moves_processed = AtomicU64::new(0);
 
-    for game in games {
-        if game.size == 6 {
-            println!("Processing {:?} vs {:?}", game.player_white, game.player_black);
+    games.par_iter()
+        .filter(|game| game.size == 6 && !game.is_bot_game() && game.game_is_legal() && game.has_standard_piececount() && game.player_white.is_some() && game.player_black.is_some())
+        .for_each(|game| {
             let mut position = <Position<6>>::start_position_with_komi(game.komi);
 
             for mv in &game.moves {
-                process_position6(&position.to_fen());
+                let topaz_start_time = Instant::now();
+                let pv = process_position6(&position.to_fen(), game.id);
+                {
+                    let topaz_time_taken = topaz_start_time.elapsed();
+                    times.lock().unwrap().insert(topaz_time_taken);
+                    *time_sum.lock().unwrap() += topaz_time_taken;
+                }
+                if let Some(moves) = pv {
+                    const NODES: u32 = 1_000_000;
+                    let settings = search::MctsSetting::default().arena_size_for_nodes(NODES);
+                    let mut tree = search::MonteCarloTree::with_settings(position.clone(), settings);
+                    for _ in 0..NODES {
+                        tree.select();
+                    }
+                    let (best_move, score) = tree.best_move();
+                    if score < 0.95 {
+                        println!("Game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
+                        println!("tps: {}", position.to_fen());
+                        print!("Topaz pv: ");
+                        for mv in moves.iter() {
+                            print!("{} ", mv.to_ptn::<Board6>());
+                        }
+                        println!("\nTiltak: {}, {:.1}%\n", best_move.to_string::<6>(), score * 100.0)
+                    }
+                    else {
+                        println!("Found boring {}-move tinue", moves.len());
+                    }    
+                }
+
                 position.do_move(mv.clone());
             }
-        }
-        if game.size > 6 {
-            num_wrong_size += 1;
-            continue;
-        }
-        num_games += 1;
-        if game.is_bot_game() {
-            println!("{:?} vs {:?}", game.player_white, game.player_black);
-            num_bot_games += 1;
-        }
-        if !game.has_standard_piececount() {
-            num_non_standard_piececounts += 1;
-        }
-        else if !game.game_is_legal() {
-            num_illegal += 1;
-        }
-    }
+            if games_processed.fetch_add(1, Ordering::SeqCst) % 100 == 0 {
+                let times_unlocked = times.lock().unwrap();
+                println!("Checked {}/{} games, {} moves, {:.2}s average time, longest {:.2}s, top 50% {:.2}s, top 1.6% {:.2}s, top 0.8% {:.2}s, top 0.4% {:.2}s, top 0.2% {:.2}s, top 0.1% {:.2}s", 
+                    games_processed.load(Ordering::SeqCst),
+                    games.len(),
+                    times_unlocked.len(),
+                    time_sum.lock().unwrap().as_secs_f32() / times_unlocked.len() as f32,
+                    times_unlocked.iter().last().cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(times_unlocked.len() / 2).cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(984 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(992 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(996 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(998 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+                    times_unlocked.iter().nth(999 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+                    );
+            }
 
-    println!("{} games total, {} bot games, {} wrong size, {} nonstandard, {} with illegal moves", num_games, num_bot_games, num_wrong_size, num_non_standard_piececounts, num_illegal);
+    });
 
     Ok(())
 }
@@ -57,14 +91,44 @@ async fn read_non_bot_games(conn: &mut SqliteConnection) -> Option<Vec<PlaytakGa
     let rows: Vec<GameRow> = sqlx::query_as("SELECT * FROM games WHERE NOT instr(player_white, \"Bot\") AND NOT instr(player_black, \"Bot\") AND NOT instr(player_white, \"bot\") AND NOT instr(player_black, \"bot\")")
         .fetch_all(conn)
         .await.ok()?;
-    rows.into_iter().map(|row| PlaytakGame::try_from(row).ok()).collect()
+    rows.into_iter()
+        .map(|row| PlaytakGame::try_from(row).ok())
+        .collect()
 }
 
-fn process_position6(tps: &str) {
+fn process_position6(tps: &str, game_id: u64) -> Option<Vec<GameMove>> {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
-    let mut tinue_search = topaz_tak::search::proof::TinueSearch::new(board);
-    println!("Is tinue: {:?}", tinue_search.is_tinue());
-
+    let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
+        .quiet()
+        .limit(1_000_000);
+    let is_tinue = first_tinue_search.is_tinue();
+    if first_tinue_search.aborted() {
+        println!("{} was aborted at first move, game id {}", tps, game_id);
+    }
+    if is_tinue == Some(true) {
+        let pv = first_tinue_search.principal_variation();
+        if !pv.is_empty() {
+            let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
+                .quiet()
+                .limit(1_000_000)
+                .exclude(pv[0]);
+            if second_tinue_search.is_tinue() == Some(true) {
+                // print!("Tinue length {}, game id {}: {}, pv ", pv.len(), game_id, tps);
+                // for mv in pv.iter() {
+                //     print!("{} ", mv.to_ptn::<topaz_tak::board::Board6>());
+                // }
+                // println!();
+                return Some(pv)
+            }
+            else {
+                println!("Found non-unique tinue")
+                
+            }
+        }
+    }
+    None
+    
+    
 }
 
 #[derive(Debug)]
@@ -128,13 +192,12 @@ impl PlaytakGame {
             "antakonistbot",
             "CrumBot",
         ];
-        if let (Some(white), Some(black)) = (self.player_white.as_ref(), self.player_black.as_ref()) {
+        if let (Some(white), Some(black)) = (self.player_white.as_ref(), self.player_black.as_ref())
+        {
             BOTS.contains(&white.as_str()) || BOTS.contains(&black.as_str())
-        }
-        else {
+        } else {
             false
         }
-
     }
 
     pub fn game_is_legal(&self) -> bool {
@@ -152,7 +215,7 @@ impl PlaytakGame {
                 legal_moves.clear();
                 position.do_move(mv.clone());
             }
-            return true;
+            true
         }
         match self.size {
             3 => game_is_legal_sized::<3>(&self.moves, self.komi),
@@ -182,8 +245,16 @@ impl TryFrom<GameRow> for PlaytakGame {
             id: row.id as u64,
             date_time: DateTime::from_utc(NaiveDateTime::from_timestamp(row.date / 1000, 0), Utc),
             size: row.size.try_into().map_err(|_| ())?,
-            player_white: if row.player_white != "Anon" { Some(row.player_white) } else { None },
-            player_black: if row.player_black != "Anon" { Some(row.player_black) } else { None },
+            player_white: if row.player_white != "Anon" {
+                Some(row.player_white)
+            } else {
+                None
+            },
+            player_black: if row.player_black != "Anon" {
+                Some(row.player_black)
+            } else {
+                None
+            },
             moves,
             result_string: row.result,
             game_time: Duration::from_secs(row.timertime.try_into().map_err(|_| ())?),
@@ -211,7 +282,7 @@ impl TryFrom<GameRow> for PlaytakGame {
             komi: Komi::from_half_komi(row.komi.try_into().map_err(|_| ())?).ok_or(())?,
             flats: if row.pieces == -1 {
                 position::starting_stones(row.size as usize) as i64
-            } else { 
+            } else {
                 row.pieces
             },
             caps: if row.capstones == -1 {
