@@ -5,13 +5,12 @@ use std::{sync::Mutex, time::Duration};
 
 use rayon::prelude::*;
 
-use board_game_traits::{GameResult, Position as PositionTrait};
+use board_game_traits::Position as PositionTrait;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pgn_traits::PgnPosition;
-use sqlx::{Connection, Executor, Row, SqliteConnection};
+use sqlx::{Connection, SqliteConnection};
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
-use topaz_tak::GameMove;
 use topaz_tak::board::Board6;
 
 #[tokio::main]
@@ -26,7 +25,6 @@ async fn main() -> Result<(), sqlx::Error> {
     let times = Mutex::new(BTreeSet::new());
     let time_sum = Mutex::new(Duration::ZERO);
     let games_processed = AtomicU64::new(0);
-    let moves_processed = AtomicU64::new(0);
 
     games.par_iter()
         .filter(|game| game.size == 6 && !game.is_bot_game() && game.game_is_legal() && game.has_standard_piececount() && game.player_white.is_some() && game.player_black.is_some())
@@ -34,33 +32,41 @@ async fn main() -> Result<(), sqlx::Error> {
             let mut position = <Position<6>>::start_position_with_komi(game.komi);
 
             for mv in &game.moves {
+                let tps = position.to_fen();
                 let topaz_start_time = Instant::now();
-                let pv = process_position6(&position.to_fen(), game.id);
+                let topaz_result = process_position6(&tps);
                 {
                     let topaz_time_taken = topaz_start_time.elapsed();
                     times.lock().unwrap().insert(topaz_time_taken);
                     *time_sum.lock().unwrap() += topaz_time_taken;
                 }
-                if let Some(moves) = pv {
-                    const NODES: u32 = 1_000_000;
-                    let settings = search::MctsSetting::default().arena_size_for_nodes(NODES);
-                    let mut tree = search::MonteCarloTree::with_settings(position.clone(), settings);
-                    for _ in 0..NODES {
-                        tree.select();
-                    }
-                    let (best_move, score) = tree.best_move();
-                    if score < 0.95 {
-                        println!("Game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
-                        println!("tps: {}", position.to_fen());
-                        print!("Topaz pv: ");
-                        for mv in moves.iter() {
-                            print!("{} ", mv.to_ptn::<Board6>());
+                match topaz_result {
+                    TopazResult::NoTinue => (),
+                    TopazResult::RoadWin => (),
+                    TopazResult::AbortedFirst => println!("{} was aborted at the first move, game id {}", tps, game.id),
+                    TopazResult::AbortedSecond(_) => println!("{} was aborted at the second move, game id {}", tps, game.id),
+                    TopazResult::NonUniqueTinue(_) => println!("Found non-unique tinue"),
+                    TopazResult::Tinue(moves) => {
+                       const NODES: u32 = 1_000_000;
+                        let settings = search::MctsSetting::default().arena_size_for_nodes(NODES);
+                        let mut tree = search::MonteCarloTree::with_settings(position.clone(), settings);
+                        for _ in 0..NODES {
+                            tree.select();
                         }
-                        println!("\nTiltak: {}, {:.1}%\n", best_move.to_string::<6>(), score * 100.0)
+                        let (best_move, score) = tree.best_move();
+                        if score < 0.95 {
+                            println!("Game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
+                            println!("tps: {}", position.to_fen());
+                            print!("Topaz pv: ");
+                            for mv in moves.iter() {
+                                print!("{} ", mv.to_string::<6>());
+                            }
+                            println!("\nTiltak: {}, {:.1}%\n", best_move.to_string::<6>(), score * 100.0)
+                        }
+                        else {
+                            println!("Found boring {}-move tinue", moves.len());
+                        }
                     }
-                    else {
-                        println!("Found boring {}-move tinue", moves.len());
-                    }    
                 }
 
                 position.do_move(mv.clone());
@@ -96,43 +102,48 @@ async fn read_non_bot_games(conn: &mut SqliteConnection) -> Option<Vec<PlaytakGa
         .collect()
 }
 
-fn process_position6(tps: &str, game_id: u64) -> Option<Vec<GameMove>> {
+enum TopazResult {
+    NoTinue,
+    RoadWin,
+    Tinue(Vec<Move>),
+    AbortedFirst,
+    AbortedSecond(Vec<Move>),
+    NonUniqueTinue(Vec<Move>),
+}
+
+fn process_position6(tps: &str) -> TopazResult {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
         .limit(5_000_000);
     let is_tinue = first_tinue_search.is_tinue();
     if first_tinue_search.aborted() {
-        println!("{} was aborted at first move, game id {}", tps, game_id);
+        return TopazResult::AbortedFirst;
     }
     if is_tinue == Some(true) {
         let pv = first_tinue_search.principal_variation();
+        let tiltak_pv = pv
+            .iter()
+            .map(|mv| Move::from_string::<6>(mv.to_ptn::<Board6>().trim_end_matches('*')).unwrap())
+            .collect();
         if !pv.is_empty() {
             let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
                 .quiet()
                 .limit(10_000_000)
                 .exclude(pv[0]);
             if second_tinue_search.aborted() {
-                println!("{} was aborted at second move, game id {}", tps, game_id);
-                return None
+                TopazResult::AbortedSecond(tiltak_pv)
+            } else if second_tinue_search.is_tinue() == Some(false) {
+                TopazResult::Tinue(tiltak_pv)
+            } else {
+                TopazResult::NonUniqueTinue(tiltak_pv)
             }
-            if second_tinue_search.is_tinue() == Some(true) {
-                // print!("Tinue length {}, game id {}: {}, pv ", pv.len(), game_id, tps);
-                // for mv in pv.iter() {
-                //     print!("{} ", mv.to_ptn::<topaz_tak::board::Board6>());
-                // }
-                // println!();
-                return Some(pv)
-            }
-            else {
-                println!("Found non-unique tinue")
-                
-            }
+        } else {
+            TopazResult::RoadWin
         }
+    } else {
+        TopazResult::NoTinue
     }
-    None
-    
-    
 }
 
 #[derive(Debug)]
