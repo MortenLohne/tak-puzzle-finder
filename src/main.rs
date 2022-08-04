@@ -100,7 +100,7 @@ fn process_position6(tps: &str, game_id: u64) -> Option<Vec<GameMove>> {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
-        .limit(1_000_000);
+        .limit(5_000_000);
     let is_tinue = first_tinue_search.is_tinue();
     if first_tinue_search.aborted() {
         println!("{} was aborted at first move, game id {}", tps, game_id);
@@ -110,8 +110,12 @@ fn process_position6(tps: &str, game_id: u64) -> Option<Vec<GameMove>> {
         if !pv.is_empty() {
             let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
                 .quiet()
-                .limit(1_000_000)
+                .limit(10_000_000)
                 .exclude(pv[0]);
+            if second_tinue_search.aborted() {
+                println!("{} was aborted at second move, game id {}", tps, game_id);
+                return None
+            }
             if second_tinue_search.is_tinue() == Some(true) {
                 // print!("Tinue length {}, game id {}: {}, pv ", pv.len(), game_id, tps);
                 // for mv in pv.iter() {
