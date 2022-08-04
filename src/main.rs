@@ -47,21 +47,33 @@ async fn main() -> Result<(), sqlx::Error> {
                     TopazResult::AbortedSecond(_) => println!("{} was aborted at the second move, game id {}", tps, game.id),
                     TopazResult::NonUniqueTinue(_) => println!("Found non-unique tinue"),
                     TopazResult::Tinue(moves) => {
-                       const NODES: u32 = 1_000_000;
+                        const NODES: u32 = 1_000_000;
                         let settings = search::MctsSetting::default().arena_size_for_nodes(NODES);
                         let mut tree = search::MonteCarloTree::with_settings(position.clone(), settings);
                         for _ in 0..NODES {
                             tree.select();
                         }
                         let (best_move, score) = tree.best_move();
-                        if score < 0.95 {
+
+                        let settings2 = search::MctsSetting::default().arena_size_for_nodes(NODES).exclude_moves(vec![best_move.clone()]);
+                        let mut tree2 = search::MonteCarloTree::with_settings(position.clone(), settings2);
+                        for _ in 0..NODES {
+                            tree2.select();
+                        }
+                        let (best_move2, score2) = tree2.best_move();
+
+                        if score.min(score2) < 0.90 {
                             println!("Game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
                             println!("tps: {}", position.to_fen());
                             print!("Topaz pv: ");
                             for mv in moves.iter() {
                                 print!("{} ", mv.to_string::<6>());
                             }
-                            println!("\nTiltak: {}, {:.1}%\n", best_move.to_string::<6>(), score * 100.0)
+                            println!("\nTiltak: {}, {:.1}%, second move {}, {:.1}%\n", 
+                                best_move.to_string::<6>(),
+                                score * 100.0,
+                                best_move2.to_string::<6>(),
+                                score2 * 100.0)
                         }
                         else {
                             println!("Found boring {}-move tinue", moves.len());
