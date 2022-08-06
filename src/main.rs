@@ -23,7 +23,9 @@ async fn main() -> Result<(), sqlx::Error> {
     let games = read_non_bot_games(&mut conn).await.unwrap();
 
     let times = Mutex::new(BTreeSet::new());
-    let time_sum = Mutex::new(Duration::ZERO);
+    let topaz_total_time = Mutex::new(Duration::ZERO);
+    let tiltak_tinue_total_time = Mutex::new(Duration::ZERO);
+    let tiltak_non_tinue_total_time = Mutex::new(Duration::ZERO);
     let games_processed = AtomicU64::new(0);
 
     games.par_iter()
@@ -34,46 +36,85 @@ async fn main() -> Result<(), sqlx::Error> {
             for mv in &game.moves {
                 let tps = position.to_fen();
                 let topaz_start_time = Instant::now();
-                let topaz_result = process_position6(&tps);
+                let topaz_result = topaz_search(&tps);
                 {
                     let topaz_time_taken = topaz_start_time.elapsed();
                     times.lock().unwrap().insert(topaz_time_taken);
-                    *time_sum.lock().unwrap() += topaz_time_taken;
+                    *topaz_total_time.lock().unwrap() += topaz_time_taken;
                 }
                 match topaz_result {
-                    TopazResult::NoTinue => (),
+                    TopazResult::NoTinue => {
+                        let tiltak_start_time = Instant::now();
+                        let TiltakResult {
+                            score_first,
+                            pv_first,
+                            score_second,
+                            pv_second
+                        } = tiltak_search(position.clone(), 100_000);
+
+                        {
+                            let tiltak_time_taken = tiltak_start_time.elapsed();
+                            *tiltak_non_tinue_total_time.lock().unwrap() += tiltak_time_taken;
+                        }
+
+                        if score_first - score_second > 0.2 {
+                            let tiltak_start_time = Instant::now();
+                            let TiltakResult {
+                                score_first,
+                                pv_first,
+                                score_second,
+                                pv_second
+                            } = tiltak_search(position.clone(), 1_000_000);
+
+                            {
+                                let tiltak_time_taken = tiltak_start_time.elapsed();
+                                *tiltak_non_tinue_total_time.lock().unwrap() += tiltak_time_taken;
+                            }
+                            if score_first - score_second > 0.2 {
+                                println!("Unique good move in game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
+                                println!("tps: {}", position.to_fen());
+                                println!("Tiltak first move:  {:.1}%, pv {}",
+                                score_first * 100.0,
+                                pv_first.iter().map(|mv| mv.to_string::<6>()).collect::<Vec<_>>().join(" "));
+                                println!("Tiltak second move: {:.1}%, pv {}",
+                                score_second * 100.0,
+                                pv_second.iter().map(|mv| mv.to_string::<6>()).collect::<Vec<_>>().join(" "));
+                                println!();
+                            }
+                            else {
+                                println!("Unique good move rejected after more thinking");
+                            }
+                        }
+                    },
                     TopazResult::RoadWin => (),
                     TopazResult::AbortedFirst => println!("{} was aborted at the first move, game id {}", tps, game.id),
                     TopazResult::AbortedSecond(_) => println!("{} was aborted at the second move, game id {}", tps, game.id),
                     TopazResult::NonUniqueTinue(_) => println!("Found non-unique tinue"),
                     TopazResult::Tinue(moves) => {
-                        const NODES: u32 = 1_000_000;
-                        let settings = search::MctsSetting::default().arena_size_for_nodes(NODES);
-                        let mut tree = search::MonteCarloTree::with_settings(position.clone(), settings);
-                        for _ in 0..NODES {
-                            tree.select();
-                        }
-                        let (best_move, score) = tree.best_move();
+                        let tiltak_start_time = Instant::now();
+                        let TiltakResult {
+                            score_first,
+                            pv_first,
+                            score_second,
+                            pv_second
+                        } = tiltak_search(position.clone(), 1_000_000);
 
-                        let settings2 = search::MctsSetting::default().arena_size_for_nodes(NODES).exclude_moves(vec![best_move.clone()]);
-                        let mut tree2 = search::MonteCarloTree::with_settings(position.clone(), settings2);
-                        for _ in 0..NODES {
-                            tree2.select();
+                        {
+                            let tiltak_time_taken = tiltak_start_time.elapsed();
+                            *tiltak_tinue_total_time.lock().unwrap() += tiltak_time_taken;
                         }
-                        let (best_move2, score2) = tree2.best_move();
 
-                        if score.min(score2) < 0.90 {
+                        if score_second < 0.90 {
                             println!("Game id {}, {:?} vs {:?}", game.id, game.player_white, game.player_black);
                             println!("tps: {}", position.to_fen());
-                            print!("Topaz pv: ");
-                            for mv in moves.iter() {
-                                print!("{} ", mv.to_string::<6>());
-                            }
-                            println!("\nTiltak: {}, {:.1}%, second move {}, {:.1}%\n", 
-                                best_move.to_string::<6>(),
-                                score * 100.0,
-                                best_move2.to_string::<6>(),
-                                score2 * 100.0)
+                            println!("Topaz pv: {}", moves.iter().map(|mv| mv.to_string::<6>()).collect::<Vec<_>>().join(" "));
+                            println!("Tiltak first move:  {:.1}%, pv {}",
+                                score_first * 100.0,
+                                pv_first.iter().map(|mv| mv.to_string::<6>()).collect::<Vec<_>>().join(" "));
+                            println!("Tiltak second move: {:.1}%, pv {}",
+                                score_second * 100.0,
+                                pv_second.iter().map(|mv| mv.to_string::<6>()).collect::<Vec<_>>().join(" "));
+                            println!();
                         }
                         else {
                             println!("Found boring {}-move tinue", moves.len());
@@ -83,13 +124,19 @@ async fn main() -> Result<(), sqlx::Error> {
 
                 position.do_move(mv.clone());
             }
-            if games_processed.fetch_add(1, Ordering::SeqCst) % 100 == 0 {
+            if games_processed.fetch_add(1, Ordering::SeqCst) % 10 == 0 {
                 let times_unlocked = times.lock().unwrap();
-                println!("Checked {}/{} games, {} moves, {:.2}s average time, longest {:.2}s, top 50% {:.2}s, top 1.6% {:.2}s, top 0.8% {:.2}s, top 0.4% {:.2}s, top 0.2% {:.2}s, top 0.1% {:.2}s", 
+                let topaz_time_unlocked = topaz_total_time.lock().unwrap();
+                let tiltak_tinue_time_unlocked = tiltak_tinue_total_time.lock().unwrap();
+                let tiltak_non_tinue_time_unlocked = tiltak_non_tinue_total_time.lock().unwrap();
+                println!("Checked {}/{} games, {} moves, {}s Tiltak non-tinue time, {}s total Tiltak tinue time, {}s total Topaz time, {:.2}s average time, longest {:.2}s, top 50% {:.2}s, top 1.6% {:.2}s, top 0.8% {:.2}s, top 0.4% {:.2}s, top 0.2% {:.2}s, top 0.1% {:.2}s", 
                     games_processed.load(Ordering::SeqCst),
                     games.len(),
                     times_unlocked.len(),
-                    time_sum.lock().unwrap().as_secs_f32() / times_unlocked.len() as f32,
+                    tiltak_non_tinue_time_unlocked.as_secs(),
+                    tiltak_tinue_time_unlocked.as_secs(),
+                    topaz_time_unlocked.as_secs(),
+                    topaz_time_unlocked.as_secs_f32() / times_unlocked.len() as f32,
                     times_unlocked.iter().last().cloned().unwrap_or_default().as_secs_f32(),
                     times_unlocked.iter().nth(times_unlocked.len() / 2).cloned().unwrap_or_default().as_secs_f32(),
                     times_unlocked.iter().nth(984 * times_unlocked.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
@@ -114,6 +161,61 @@ async fn read_non_bot_games(conn: &mut SqliteConnection) -> Option<Vec<PlaytakGa
         .collect()
 }
 
+struct TiltakResult {
+    score_first: f32,
+    pv_first: Vec<Move>,
+    score_second: f32,
+    pv_second: Vec<Move>,
+}
+
+fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakResult {
+    let settings1 = search::MctsSetting::default().arena_size_for_nodes(nodes);
+    let mut tree1 = search::MonteCarloTree::with_settings(position.clone(), settings1);
+    for _ in 0..nodes {
+        match tree1.select() {
+            Some(_) => (),
+            None => {
+                eprintln!("Tiltak search aborted early due to oom");
+                break;
+            }
+        }
+    }
+
+    let (best_move, score) = tree1.best_move();
+
+    let settings2 = search::MctsSetting::default()
+        .arena_size_for_nodes(nodes)
+        .exclude_moves(vec![best_move]);
+    let mut tree2 = search::MonteCarloTree::with_settings(position, settings2);
+    for _ in 0..nodes {
+        match tree2.select() {
+            Some(_) => (),
+            None => {
+                eprintln!("Tiltak search aborted early due to oom");
+                break;
+            }
+        }
+    }
+
+    // It's possible that the second move actually scores better than the first move
+    // In that case, swap the moves, to make later processing easier
+    if tree2.best_move().1 > score {
+        TiltakResult {
+            score_first: tree2.best_move().1,
+            pv_first: tree2.pv().collect(),
+            score_second: score,
+            pv_second: tree1.pv().collect(),
+        }
+    } else {
+        TiltakResult {
+            score_first: score,
+            pv_first: tree1.pv().collect(),
+            score_second: tree2.best_move().1,
+            pv_second: tree2.pv().collect(),
+        }
+    }
+}
+
 enum TopazResult {
     NoTinue,
     RoadWin,
@@ -123,7 +225,7 @@ enum TopazResult {
     NonUniqueTinue(Vec<Move>),
 }
 
-fn process_position6(tps: &str) -> TopazResult {
+fn topaz_search(tps: &str) -> TopazResult {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
