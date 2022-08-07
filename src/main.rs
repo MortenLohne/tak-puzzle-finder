@@ -271,6 +271,40 @@ async fn read_non_bot_games(conn: &mut SqliteConnection) -> Option<Vec<PlaytakGa
         .collect()
 }
 
+struct PossiblePuzzle {
+    playtak_game: PlaytakGame,
+    tps: String,
+    previous_tps: String,
+    previous_move: Move,
+    road_moves: Vec<Move>,
+    followup_move: Option<Move>,
+    topaz_tinue: Option<Vec<Move>>,
+    topaz_tinue_avoidance: Option<TinueAvoidance>,
+    tiltak_shallow_analyis: TiltakResult,
+    tiltak_deep_analysis: Option<TiltakResult>,
+}
+
+impl PossiblePuzzle {
+    fn is_puzzle(&self) -> bool {
+        self.topaz_tinue.is_some() || self.topaz_tinue_avoidance.is_some()
+    }
+
+    fn solution(&self) -> Option<Move> {
+        self.topaz_tinue
+            .as_ref()
+            .and_then(|tinue| tinue.get(0).cloned())
+            .or(self
+                .topaz_tinue_avoidance
+                .as_ref()
+                .map(|avoidance| avoidance.defense.clone()))
+    }
+}
+
+struct TinueAvoidance {
+    defense: Move,
+    refutations: Vec<[Move; 2]>,
+}
+
 #[derive(Default)]
 struct Stats {
     topaz_tinue: TimeTracker,
