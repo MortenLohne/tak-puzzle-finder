@@ -16,6 +16,13 @@ use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
 
+const TILTAK_SHALLOW_NODES: u32 = 50_000;
+const TILTAK_DEEP_NODES: u32 = 1_000_000;
+
+const TOPAZ_FIRST_MOVE_NODES: usize = 5_000_000;
+const TOPAZ_SECOND_MOVE_NODES: usize = 10_000_000;
+const TOPAZ_AVOIDANCE_NODES: usize = 1_000_000;
+
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
     // Create a connection pool
@@ -34,6 +41,18 @@ async fn main() -> Result<(), sqlx::Error> {
     }
 
     let games = read_non_bot_games(&mut db_conn).await.unwrap();
+
+    let relevant_games: Vec<PlaytakGame> = games
+        .into_iter()
+        .filter(|game| {
+            game.size == 5
+                && !game.is_bot_game()
+                && game.game_is_legal()
+                && game.has_standard_piececount()
+                && game.player_white.is_some()
+                && game.player_black.is_some()
+        })
+        .collect();
 
     let start_time = Instant::now();
     let stats = Stats::default();
@@ -66,55 +85,47 @@ async fn main() -> Result<(), sqlx::Error> {
     let (game_sender, game_receiver) = mpsc::channel();
 
     task::spawn_blocking(move || {
-        games
-            .par_iter()
-            .filter(|game| {
-                game.size == 5
-                    && !game.is_bot_game()
-                    && game.game_is_legal()
-                    && game.has_standard_piececount()
-                    && game.player_white.is_some()
-                    && game.player_black.is_some()
-            })
-            .for_each(|game| {
-                let mut has_been_aborted = false;
-                for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
-                    if matches!(
-                        possible_puzzle.topaz_tinue,
-                        TopazResult::AbortedFirst | TopazResult::AbortedSecond(_)
-                    ) || matches!(
-                        possible_puzzle.topaz_tinue_avoidance,
-                        Some(TopazAvoidanceResult::Aborted)
-                    ) {
-                        has_been_aborted = true;
-                    }
-                    if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
-                        puzzle_sender.send(puzzle).unwrap();
-                    }
+        relevant_games.par_iter().for_each(|game| {
+            let mut has_been_aborted = false;
+            for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
+                if matches!(
+                    possible_puzzle.topaz_tinue,
+                    TopazResult::AbortedFirst | TopazResult::AbortedSecond(_)
+                ) || matches!(
+                    possible_puzzle.topaz_tinue_avoidance,
+                    Some(TopazAvoidanceResult::Aborted)
+                ) {
+                    has_been_aborted = true;
                 }
-
-                game_sender.send((game.id, has_been_aborted)).unwrap();
-
-                if games_processed.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
-                    println!(
-                        "Checked {}/{} games in {}s",
-                        games_processed.load(Ordering::SeqCst),
-                        games.len(),
-                        start_time.elapsed().as_secs()
-                    );
-                    print!("Topaz tinue: ");
-                    stats.topaz_tinue.print_full();
-                    print!("Topaz tinue avoidance: ");
-                    stats.topaz_tinue_avoidance.print_full();
-                    print!("Tiltak non tinue (short): ");
-                    stats.tiltak_non_tinue_short.print_short();
-                    print!("Tiltak non tinue (long): ");
-                    stats.tiltak_non_tinue_long.print_short();
-                    print!("Tiltak tinue: ");
-                    stats.tiltak_tinue.print_short();
-                    println!();
+                if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
+                    puzzle_sender.send(puzzle).unwrap();
                 }
-            })
+            }
+
+            game_sender.send((game.id, has_been_aborted)).unwrap();
+
+            if games_processed.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
+                println!(
+                    "Checked {}/{} games in {}s",
+                    games_processed.load(Ordering::SeqCst),
+                    relevant_games.len(),
+                    start_time.elapsed().as_secs()
+                );
+                print!("Topaz tinue first move: ");
+                stats.topaz_tinue_first.print_full();
+                print!("Topaz tinue second move: ");
+                stats.topaz_tinue_second.print_full();
+                print!("Topaz tinue avoidance: ");
+                stats.topaz_tinue_avoidance.print_full();
+                print!("Tiltak non tinue (short): ");
+                stats.tiltak_non_tinue_short.print_short();
+                print!("Tiltak non tinue (long): ");
+                stats.tiltak_non_tinue_long.print_short();
+                print!("Tiltak tinue: ");
+                stats.tiltak_tinue.print_short();
+                println!();
+            }
+        })
     });
 
     task::spawn(async move {
@@ -145,7 +156,7 @@ async fn main() -> Result<(), sqlx::Error> {
         {
             if err.as_database_error().is_some_and(|db_err| db_err.is_unique_violation()) {
                 println!("Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}", tps, game_id, err);
-                continue;
+                break;
             }
             println!("Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}", tps, game_id, err);
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -200,7 +211,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
 
         let tiltak_analysis_shallow = {
             let start_time = Instant::now();
-            let result = tiltak_search(position.clone(), 50_000);
+            let result = tiltak_search(position.clone(), TILTAK_SHALLOW_NODES);
 
             stats.tiltak_non_tinue_short.record(start_time.elapsed());
 
@@ -220,12 +231,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
             is_win
         });
 
-        let topaz_result = {
-            let start_time = Instant::now();
-            let result = topaz_search::<S>(&tps);
-            stats.topaz_tinue.record(start_time.elapsed());
-            result
-        };
+        let topaz_result = topaz_search::<S>(&tps, stats);
 
         let mut possible_puzzle = PossiblePuzzle {
             playtak_game: game.clone(),
@@ -274,7 +280,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
                         > 0.3
                 {
                     let tiltak_start_time = Instant::now();
-                    let tiltak_analysis_deep = tiltak_search(position.clone(), 1_000_000);
+                    let tiltak_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
 
                     possible_puzzle.tiltak_analysis_deep = Some(tiltak_analysis_deep);
 
@@ -287,7 +293,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
             TopazResult::NonUniqueTinue(_) => last_move_was_tinue = true,
             TopazResult::Tinue(_) => {
                 let tiltak_start_time = Instant::now();
-                let tiltak_analysis_deep = tiltak_search(position.clone(), 1_000_000);
+                let tiltak_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
 
                 possible_puzzle.tiltak_analysis_deep = Some(tiltak_analysis_deep);
 
@@ -503,7 +509,8 @@ struct TinueAvoidance {
 
 #[derive(Default)]
 struct Stats {
-    topaz_tinue: TimeTracker,
+    topaz_tinue_first: TimeTracker,
+    topaz_tinue_second: TimeTracker,
     topaz_tinue_avoidance: TimeTracker,
     tiltak_tinue: TimeTracker,
     tiltak_non_tinue_short: TimeTracker,
@@ -622,20 +629,23 @@ enum TopazResult {
     NonUniqueTinue(Vec<Move>),
 }
 
-fn topaz_search<const S: usize>(tps: &str) -> TopazResult {
+fn topaz_search<const S: usize>(tps: &str, stats: &Stats) -> TopazResult {
     match S {
-        5 => topaz_search_5s(tps),
-        6 => topaz_search_6s(tps),
+        5 => topaz_search_5s(tps, stats),
+        6 => topaz_search_6s(tps, stats),
         _ => unimplemented!(),
     }
 }
 
-fn topaz_search_5s(tps: &str) -> TopazResult {
+fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult {
     let board = topaz_tak::board::Board5::try_from_tps(tps).unwrap();
+    let start_time = Instant::now();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
-        .limit(5_000_000);
+        .limit(TOPAZ_FIRST_MOVE_NODES);
     let is_tinue = first_tinue_search.is_tinue();
+    stats.topaz_tinue_first.record(start_time.elapsed());
+
     if first_tinue_search.aborted() {
         return TopazResult::AbortedFirst;
     }
@@ -646,10 +656,14 @@ fn topaz_search_5s(tps: &str) -> TopazResult {
             .map(|mv| Move::from_string::<5>(mv.to_ptn::<Board5>().trim_end_matches('*')).unwrap())
             .collect();
         if !pv.is_empty() {
+            let start_time = Instant::now();
             let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
                 .quiet()
-                .limit(10_000_000)
+                .limit(TOPAZ_SECOND_MOVE_NODES)
                 .exclude(pv[0]);
+            second_tinue_search.is_tinue();
+            stats.topaz_tinue_second.record(start_time.elapsed());
+
             if second_tinue_search.aborted() {
                 TopazResult::AbortedSecond(tiltak_pv)
             } else if second_tinue_search.is_tinue() == Some(false) {
@@ -665,12 +679,15 @@ fn topaz_search_5s(tps: &str) -> TopazResult {
     }
 }
 
-fn topaz_search_6s(tps: &str) -> TopazResult {
+fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
+    let start_time = Instant::now();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
-        .limit(5_000_000);
+        .limit(TOPAZ_FIRST_MOVE_NODES);
     let is_tinue = first_tinue_search.is_tinue();
+    stats.topaz_tinue_first.record(start_time.elapsed());
+
     if first_tinue_search.aborted() {
         return TopazResult::AbortedFirst;
     }
@@ -681,10 +698,14 @@ fn topaz_search_6s(tps: &str) -> TopazResult {
             .map(|mv| Move::from_string::<6>(mv.to_ptn::<Board6>().trim_end_matches('*')).unwrap())
             .collect();
         if !pv.is_empty() {
+            let start_time = Instant::now();
             let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
                 .quiet()
-                .limit(10_000_000)
+                .limit(TOPAZ_SECOND_MOVE_NODES)
                 .exclude(pv[0]);
+            second_tinue_search.is_tinue();
+            stats.topaz_tinue_second.record(start_time.elapsed());
+
             if second_tinue_search.aborted() {
                 TopazResult::AbortedSecond(tiltak_pv)
             } else if second_tinue_search.is_tinue() == Some(false) {
@@ -736,7 +757,7 @@ fn topaz_tinue_avoidance<const S: usize>(
         position.reverse_move(reverse_move);
         let mut tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
             .quiet()
-            .limit(1_000_000);
+            .limit(TOPAZ_AVOIDANCE_NODES);
         if tinue_search.aborted() {
             return TopazAvoidanceResult::Aborted;
         }
