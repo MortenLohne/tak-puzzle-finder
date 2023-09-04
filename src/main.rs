@@ -158,10 +158,13 @@ async fn real_main() -> Result<(), sqlx::Error> {
     for game in relevant_games {
         sender.send(game).await.unwrap();
     }
+    sender.close();
+    println!("Started processing the last game");
 
     for handle in join_handles {
         handle.await.unwrap();
     }
+    println!("Analysis complete");
     Ok(())
 }
 
