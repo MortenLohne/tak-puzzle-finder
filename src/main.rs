@@ -1,20 +1,19 @@
 use std::collections::BTreeSet;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-
-use async_channel::Receiver;
-use sqlx::sqlite::SqliteConnectOptions;
-use tokio::{runtime, task};
+use rayon::prelude::*;
 
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pgn_traits::PgnPosition;
-use sqlx::{Connection, SqliteConnection, SqlitePool};
+use rusqlite::ErrorCode;
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -27,171 +26,218 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 10_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 1_000_000;
 
 fn main() {
-    let runtime = runtime::Builder::new_multi_thread()
-        .global_queue_interval(1)
-        .disable_lifo_slot()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async { real_main().await.unwrap() });
-}
-
-// #[tokio::main(flavor = "multi_thread", worker_threads = 24)]
-async fn real_main() -> Result<(), sqlx::Error> {
     // Create a connection pool
     //  for MySQL, use MySqlPoolOptions::new()
     //  for SQLite, use SqlitePoolOptions::new()
     //  etc.
-    let mut db_conn = SqliteConnection::connect("sqlite:games_anon.db").await?;
+    let mut db_conn = rusqlite::Connection::open("games_anon.db").unwrap();
 
-    match sqlx::query("ALTER TABLE games ADD has_been_analyzed INTEGER DEFAULT 0")
-        .execute(&mut db_conn)
-        .await
-    {
+    match db_conn.execute(
+        "ALTER TABLE games ADD has_been_analyzed INTEGER DEFAULT 0",
+        [],
+    ) {
         Ok(_) => (),
-        Err(sqlx::Error::Database(err)) if err.message().starts_with("duplicate column name") => (),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.starts_with("duplicate column name") => {}
+
         Err(err) => panic!("{}", err),
     }
 
-    let games = read_non_bot_games(&mut db_conn).await.unwrap();
+    let games = read_non_bot_games(&mut db_conn).unwrap();
 
     let mut relevant_games: Vec<PlaytakGame> = games
         .into_iter()
         .filter(|game| {
             game.size == 5
+                && game.moves.len() > 4
                 && !game.is_bot_game()
                 && game.game_is_legal()
                 && game.has_standard_piececount()
-                && game.player_white.is_some()
-                && game.player_black.is_some()
         })
         .collect();
 
     relevant_games.shuffle(&mut thread_rng());
 
-    let (sender, receiver) = async_channel::bounded(1);
-
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
     let games_processed = Arc::new(AtomicU64::new(0));
 
-    let puzzles_pool = SqlitePool::connect_with(
-        SqliteConnectOptions::new()
-            .filename("puzzles.db")
-            .create_if_missing(true),
-    )
-    .await?;
+    let puzzles_pool = rusqlite::Connection::open("puzzles.db").unwrap();
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS \"puzzles\" (
-        \"game_id\"	INTEGER NOT NULL,
-        \"tps\"	TEXT NOT NULL UNIQUE,
-        \"solution\" TEXT NOT NULL,
-        \"tiltak_eval\"	REAL NOT NULL,
-        \"tiltak_second_move_eval\"	REAL NOT NULL,
-        \"tinue_length\" INTEGER,
-        \"tinue_avoidance_length\" INTEGER,
-        PRIMARY KEY(\"tps\")
-    )",
-    )
-    .execute(&puzzles_pool)
-    .await
-    .unwrap();
+    puzzles_pool
+        .execute(
+            "CREATE TABLE IF NOT EXISTS games(
+            id INT PRIMARY KEY,
+            date INT,
+            size INT,
+            player_white VARCHAR(20),
+            player_black VARCHAR(20),
+            notation TEXT,
+            result VARCAR(10),
+            timertime INT NOT NULL,
+            timerinc INT NOT NULL,
+            rating_white INT NOT NULL,
+            rating_black INT NOT NULL,
+            unrated INT NOT NULL,
+            tournament INT NOT NULL,
+            komi INT NOT NULL,
+            has_been_analyzed INT DEFAULT 0
+        )",
+            [],
+        )
+        .unwrap();
 
-    let db_conn = Arc::new(tokio::sync::Mutex::new(db_conn));
-    let puzzles_pool = Arc::new(tokio::sync::Mutex::new(puzzles_pool));
+    let mut stmt = puzzles_pool.prepare("INSERT OR IGNORE INTO games (
+            id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi, has_been_analyzed)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)").unwrap();
+
+    for game in relevant_games.iter() {
+        stmt.execute(rusqlite::params![
+            game.id,
+            game.date_time,
+            game.size,
+            game.player_white,
+            game.player_black,
+            game.moves
+                .iter()
+                .fold(String::with_capacity(200), |mut moves, mv| {
+                    match game.size {
+                        5 => write!(moves, "{} ", mv.to_string::<5>()).unwrap(),
+                        6 => write!(moves, "{} ", mv.to_string::<6>()).unwrap(),
+                        _ => unimplemented!(),
+                    };
+                    moves
+                }),
+            game.result_string,
+            game.game_time.as_secs(),
+            game.increment.as_secs(),
+            game.rating_white.unwrap_or_default(),
+            game.rating_black.unwrap_or_default(),
+            game.is_rated,
+            game.is_tournament,
+            game.komi.half_komi()
+        ])
+        .unwrap();
+    }
+
+    puzzles_pool
+        .execute(
+            "CREATE TABLE IF NOT EXISTS puzzles (
+            game_id	INTEGER NOT NULL,
+            tps	TEXT PRIMARY KEY,
+            solution TEXT NOT NULL,
+            tiltak_eval	REAL NOT NULL,
+            tiltak_second_move_eval	REAL NOT NULL,
+            tinue_length INTEGER,
+            tinue_avoidance_length INTEGER,
+            FOREIGN KEY(game_id) REFERENCES games(id)
+            )",
+            [],
+        )
+        .unwrap();
+
+    puzzles_pool
+        .execute(
+            "CREATE TABLE IF NOT EXISTS failed_puzzles (
+            game_id	INTEGER NOT NULL,
+            tps	TEXT PRIMARY KEY,
+            failure_kind TEXT,
+            FOREIGN KEY(game_id) REFERENCES games(id)
+            )",
+            [],
+        )
+        .unwrap();
+
     let num_games = relevant_games.len();
-    let mut join_handles = vec![];
 
-    for _ in 0..24 {
-        let receiver: Receiver<PlaytakGame> = receiver.clone();
-        let stats = stats.clone();
-        let db_conn = db_conn.clone();
-        let puzzles_pool = puzzles_pool.clone();
-        let games_processed = games_processed.clone();
-
-        let handle = task::spawn(async move {
-            while let Ok(game) = receiver.recv().await {
-                let mut has_been_aborted = false;
-                for possible_puzzle in generate_possible_puzzle::<5>(&stats, &game) {
-                    if matches!(
-                        possible_puzzle.topaz_tinue,
-                        TopazResult::AbortedFirst | TopazResult::AbortedSecond(_)
-                    ) || matches!(
-                        possible_puzzle.topaz_tinue_avoidance,
-                        Some(TopazAvoidanceResult::Aborted)
-                    ) {
-                        has_been_aborted = true;
-                    }
-                    if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
-                        store_puzzle(&puzzles_pool, puzzle).await;
-                    }
-                }
-
-                set_game_analyzed(&db_conn, game.id, has_been_aborted).await;
-
-                if games_processed.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
-                    println!(
-                        "Checked {}/{} games in {}s",
-                        games_processed.load(Ordering::SeqCst),
-                        num_games,
-                        start_time.elapsed().as_secs()
-                    );
-                    print!("Topaz tinue first move: ");
-                    stats.topaz_tinue_first.print_full();
-                    print!("Topaz tinue second move: ");
-                    stats.topaz_tinue_second.print_full();
-                    print!("Topaz tinue avoidance: ");
-                    stats.topaz_tinue_avoidance.print_full();
-                    print!("Tiltak non tinue (short): ");
-                    stats.tiltak_non_tinue_short.print_short();
-                    print!("Tiltak non tinue (long): ");
-                    stats.tiltak_non_tinue_long.print_short();
-                    print!("Tiltak tinue: ");
-                    stats.tiltak_tinue.print_short();
-                    println!();
+    relevant_games.par_iter().for_each_init(
+        || rusqlite::Connection::open("puzzles.db").unwrap(),
+        |puzzle_conn, game| {
+            for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
+                if let TopazResult::AbortedFirst = possible_puzzle.topaz_tinue {
+                    store_failed_puzzle(
+                        puzzle_conn,
+                        game.id as u32,
+                        &possible_puzzle.tps,
+                        "Topaz timed out on primary move",
+                    )
+                } else if let TopazResult::AbortedSecond(_) = possible_puzzle.topaz_tinue {
+                    store_failed_puzzle(
+                        puzzle_conn,
+                        game.id as u32,
+                        &possible_puzzle.tps,
+                        "Topaz timed out on secondary move",
+                    )
+                } else if let Some(TopazAvoidanceResult::Aborted) =
+                    possible_puzzle.topaz_tinue_avoidance
+                {
+                    store_failed_puzzle(
+                        puzzle_conn,
+                        game.id as u32,
+                        &possible_puzzle.tps,
+                        "Topaz timed out on tinue avoidance",
+                    )
+                } else if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
+                    store_puzzle(puzzle_conn, puzzle);
                 }
             }
-        });
-        join_handles.push(handle);
-    }
-    for game in relevant_games {
-        sender.send(game).await.unwrap();
-    }
-    sender.close();
-    println!("Started processing the last game");
 
-    for handle in join_handles {
-        handle.await.unwrap();
-    }
+            set_game_analyzed(puzzle_conn, game.id);
+
+            if games_processed.fetch_add(1, Ordering::SeqCst) % 10 == 0 {
+                println!(
+                    "Checked {}/{} games in {}s",
+                    games_processed.load(Ordering::SeqCst),
+                    num_games,
+                    start_time.elapsed().as_secs()
+                );
+                print!("Topaz tinue first move: ");
+                stats.topaz_tinue_first.print_full();
+                print!("Topaz tinue second move: ");
+                stats.topaz_tinue_second.print_full();
+                print!("Topaz tinue avoidance: ");
+                stats.topaz_tinue_avoidance.print_full();
+                print!("Tiltak non tinue (short): ");
+                stats.tiltak_non_tinue_short.print_short();
+                print!("Tiltak non tinue (long): ");
+                stats.tiltak_non_tinue_long.print_short();
+                print!("Tiltak tinue: ");
+                stats.tiltak_tinue.print_short();
+                println!();
+            }
+        },
+    );
+
     println!("Analysis complete");
-    Ok(())
 }
 
-async fn set_game_analyzed(
-    db_conn: &tokio::sync::Mutex<SqliteConnection>,
-    game_id: u64,
-    has_been_aborted: bool,
-) {
-    let analyzed = if has_been_aborted { 2 } else { 1 };
-
-    let mut db_conn = db_conn.lock().await;
-
-    while let Err(err) = sqlx::query("UPDATE games SET has_been_analyzed = ?1 WHERE id = ?2")
-        .bind(analyzed)
-        .bind(game_id as u32)
-        .execute(&mut *db_conn)
-        .await
-    {
+fn set_game_analyzed(conn: &mut rusqlite::Connection, game_id: u64) {
+    while let Err(err) = conn.execute(
+        "UPDATE games SET has_been_analyzed = 1 WHERE id = ?1",
+        [game_id as u32],
+    ) {
         println!(
             "Failed to update game #{} into DB. Retrying in 1s: {}",
             game_id, err
         );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
-async fn store_puzzle(puzzles_pool: &tokio::sync::Mutex<SqlitePool>, puzzle: Puzzle) {
+fn store_failed_puzzle(
+    conn: &mut rusqlite::Connection,
+    game_id: u32,
+    tps: &str,
+    failure_kind: &str,
+) {
+    conn.execute(
+        "INSERT INTO failed_puzzles (game_id, tps, failure_kind) values (?1, ?2, ?3)",
+        rusqlite::params![game_id, tps, failure_kind],
+    )
+    .unwrap();
+}
+
+fn store_puzzle(puzzles_pool: &mut rusqlite::Connection, puzzle: Puzzle) {
     let Puzzle {
         game_id,
         tps,
@@ -202,36 +248,61 @@ async fn store_puzzle(puzzles_pool: &tokio::sync::Mutex<SqlitePool>, puzzle: Puz
         tinue_avoidance_length,
     } = puzzle;
 
-    let puzzles_pool = puzzles_pool.lock().await;
-
-    while let Err(err) =
-    sqlx::query(
-    "INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-        ).bind(game_id as u32)
-        .bind(tps.clone())
-        .bind(solution.clone())
-        .bind(tiltak_eval)
-        .bind(tiltak_second_move_eval)
-        .bind(tinue_length)
-        .bind(tinue_avoidance_length)
-        .execute(&*puzzles_pool)
-        .await
-    {
-        if err.as_database_error().is_some_and(|db_err| db_err.is_unique_violation()) {
-            println!("Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}", tps, game_id, err);
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params![
+        game_id as u32,
+        tps.clone(),
+        solution.clone(),
+        tiltak_eval,
+        tiltak_second_move_eval,
+        tinue_length,
+        tinue_avoidance_length,
+    ]) {
+        if err.code == ErrorCode::ConstraintViolation {
+            println!(
+                "Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}",
+                tps, game_id, err
+            );
             break;
         }
-        println!("Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}", tps, game_id, err);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        println!(
+            "Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}",
+            tps, game_id, err
+        );
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
-async fn read_non_bot_games(conn: &mut SqliteConnection) -> Option<Vec<PlaytakGame>> {
-    let rows: Vec<GameRow> = sqlx::query_as("SELECT * FROM games WHERE has_been_analyzed = 0 AND NOT instr(player_white, \"Bot\") AND NOT instr(player_black, \"Bot\") AND NOT instr(player_white, \"bot\") AND NOT instr(player_black, \"bot\")")
-        .fetch_all(conn)
-        .await.ok()?;
-    rows.into_iter()
-        .map(|row| PlaytakGame::try_from(row).ok())
+fn read_non_bot_games(conn: &mut rusqlite::Connection) -> Option<Vec<PlaytakGame>> {
+    let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi, pieces, capstones FROM games
+        WHERE NOT instr(player_white, \"Bot\") 
+        AND NOT instr(player_black, \"Bot\") 
+        AND NOT instr(player_white, \"bot\") 
+        AND NOT instr(player_black, \"bot\")")
+    .unwrap();
+    let rows = stmt.query([]).unwrap().mapped(|row| {
+        Ok(GameRow {
+            id: row.get(0).unwrap(),
+            date: DateTime::from_naive_utc_and_offset(
+                NaiveDateTime::from_timestamp_opt(row.get::<_, i64>(1).unwrap() / 1000, 0).unwrap(),
+                Utc,
+            ),
+            size: row.get(2).unwrap(),
+            player_white: row.get(3).unwrap(),
+            player_black: row.get(4).unwrap(),
+            notation: row.get(5).unwrap(),
+            result: row.get(6).unwrap(),
+            timertime: Duration::from_secs(row.get(7).unwrap()),
+            timerinc: Duration::from_secs(row.get(8).unwrap()),
+            rating_white: row.get(9).unwrap(),
+            rating_black: row.get(10).unwrap(),
+            unrated: row.get(11).unwrap(),
+            tournament: row.get(12).unwrap(),
+            komi: row.get(13).unwrap(),
+            pieces: row.get(14).unwrap(),
+            capstones: row.get(15).unwrap(),
+        })
+    });
+    rows.map(|row| PlaytakGame::try_from(row.unwrap()).ok())
         .collect()
 }
 
@@ -360,7 +431,7 @@ CREATE TABLE "puzzles" (
 );
 */
 
-#[derive(sqlx::FromRow, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct Puzzle {
     game_id: u64,
     tps: String,
@@ -410,141 +481,11 @@ impl PossiblePuzzle {
         }
         Some(puzzle)
     }
-
-    fn print_stuff<const S: usize>(&self) {
-        let Self {
-            playtak_game,
-            tps,
-            topaz_tinue_avoidance,
-            tiltak_analysis_shallow,
-            ..
-        } = &self;
-
-        match &self.topaz_tinue {
-            TopazResult::AbortedFirst => {
-                println!(
-                    "{} was aborted at the first move, game id {}",
-                    tps, playtak_game.id
-                );
-                return;
-            }
-            TopazResult::AbortedSecond(_) => {
-                println!(
-                    "{} was aborted at the second move, game id {}",
-                    tps, playtak_game.id
-                );
-                return;
-            }
-            TopazResult::NonUniqueTinue(_) => {
-                println!("Found non-unique tinue");
-                return;
-            }
-            _ => (),
-        };
-
-        if let TopazResult::Tinue(topaz_tinue) = self.topaz_tinue.clone() {
-            let TiltakResult {
-                nodes,
-                score_first,
-                pv_first,
-                score_second,
-                pv_second,
-            } = self.tiltak_analysis_deep.clone().unwrap();
-
-            if score_second < 0.90 {
-                println!(
-                    "Tinue in game id {}, {:?} vs {:?}",
-                    playtak_game.id, playtak_game.player_white, playtak_game.player_black
-                );
-                println!("tps: {}", tps);
-                println!(
-                    "Topaz pv: {}",
-                    topaz_tinue
-                        .iter()
-                        .map(|mv| mv.to_string::<S>())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                println!(
-                    "Tiltak first move:  {:.1}%, pv {}",
-                    score_first * 100.0,
-                    pv_first
-                        .iter()
-                        .map(|mv| mv.to_string::<S>())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                println!(
-                    "Tiltak second move: {:.1}%, pv {}",
-                    score_second * 100.0,
-                    pv_second
-                        .iter()
-                        .map(|mv| mv.to_string::<S>())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                println!();
-            } else {
-                println!("Found boring {}-move tinue", topaz_tinue.len());
-            }
-        } else if let Some(tiltak_analysis_deep) = self.tiltak_analysis_deep.as_ref() {
-            let is_tinue_avoidance = matches!(
-                topaz_tinue_avoidance,
-                Some(TopazAvoidanceResult::Defence(_))
-            );
-            if is_tinue_avoidance {
-                println!(
-                    "Tinue avoidance in game id {}, {:?} vs {:?}",
-                    playtak_game.id, playtak_game.player_white, playtak_game.player_black
-                );
-            } else if tiltak_analysis_deep.score_first > 0.5
-                && tiltak_analysis_deep.score_second < 0.5
-                && tiltak_analysis_deep.score_first > tiltak_analysis_deep.score_second + 0.3
-            {
-                println!(
-                    "Unique good move in game id {}, {:?} vs {:?}",
-                    playtak_game.id, playtak_game.player_white, playtak_game.player_black
-                );
-            } else {
-                println!(
-                    "Unique good move rejected after more thinking, shallow scores {:.1}% vs {:.1}% deep scores {:.1}% vs {:.1}%",
-                    tiltak_analysis_shallow.score_first * 100.0,
-                    tiltak_analysis_shallow.score_second * 100.0,
-                    tiltak_analysis_deep.score_first * 100.0,
-                    tiltak_analysis_deep.score_second * 100.0
-                );
-                return;
-            }
-            println!("tps: {}", tps);
-            println!(
-                "Tiltak first move:  {:.1}%, pv {}",
-                tiltak_analysis_deep.score_first * 100.0,
-                tiltak_analysis_deep
-                    .pv_first
-                    .iter()
-                    .map(|mv| mv.to_string::<S>())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            println!(
-                "Tiltak second move: {:.1}%, pv {}",
-                tiltak_analysis_deep.score_second * 100.0,
-                tiltak_analysis_deep
-                    .pv_second
-                    .iter()
-                    .map(|mv| mv.to_string::<S>())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            println!();
-        }
-    }
 }
 
 #[derive(Clone)]
 struct TinueAvoidance {
     defense: Move,
-    refutations: Vec<[Move; 2]>,
     longest_refutation_length: u32,
 }
 
@@ -604,7 +545,6 @@ impl TimeTracker {
 
 #[derive(Debug, Clone)]
 struct TiltakResult {
-    nodes: u32,
     score_first: f32,
     pv_first: Vec<Move>,
     score_second: f32,
@@ -643,7 +583,6 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
     // In that case, swap the moves, to make later processing easier
     if tree2.best_move().1 > score {
         TiltakResult {
-            nodes,
             score_first: tree2.best_move().1,
             pv_first: tree2.pv().collect(),
             score_second: score,
@@ -651,7 +590,6 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
         }
     } else {
         TiltakResult {
-            nodes,
             score_first: score,
             pv_first: tree1.pv().collect(),
             score_second: tree2.best_move().1,
@@ -821,7 +759,6 @@ fn topaz_tinue_avoidance<const S: usize>(
     if let Some(mv) = defense {
         TopazAvoidanceResult::Defence(TinueAvoidance {
             defense: mv,
-            refutations,
             longest_refutation_length,
         })
     } else {
@@ -834,8 +771,8 @@ struct PlaytakGame {
     id: u64,
     date_time: DateTime<Utc>,
     size: usize,
-    player_white: Option<String>,
-    player_black: Option<String>,
+    player_white: String,
+    player_black: String,
     moves: Vec<Move>,
     result_string: String,
     game_time: Duration,
@@ -847,8 +784,6 @@ struct PlaytakGame {
     komi: Komi,
     flats: i64,
     caps: i64,
-    rating_change_white: Option<i64>,
-    rating_change_black: Option<i64>,
 }
 
 impl PlaytakGame {
@@ -890,12 +825,7 @@ impl PlaytakGame {
             "antakonistbot",
             "CrumBot",
         ];
-        if let (Some(white), Some(black)) = (self.player_white.as_ref(), self.player_black.as_ref())
-        {
-            BOTS.contains(&white.as_str()) || BOTS.contains(&black.as_str())
-        } else {
-            false
-        }
+        BOTS.contains(&self.player_white.as_str()) || BOTS.contains(&self.player_black.as_str())
     }
 
     pub fn game_is_legal(&self) -> bool {
@@ -941,25 +871,14 @@ impl TryFrom<GameRow> for PlaytakGame {
         };
         Ok(PlaytakGame {
             id: row.id as u64,
-            date_time: DateTime::from_naive_utc_and_offset(
-                NaiveDateTime::from_timestamp_opt(row.date / 1000, 0).unwrap(),
-                Utc,
-            ),
+            date_time: row.date,
             size: row.size.try_into().map_err(|_| ())?,
-            player_white: if row.player_white != "Anon" {
-                Some(row.player_white)
-            } else {
-                None
-            },
-            player_black: if row.player_black != "Anon" {
-                Some(row.player_black)
-            } else {
-                None
-            },
+            player_white: row.player_white,
+            player_black: row.player_black,
             moves,
             result_string: row.result,
-            game_time: Duration::from_secs(row.timertime.try_into().map_err(|_| ())?),
-            increment: Duration::from_secs(row.timerinc.try_into().map_err(|_| ())?),
+            game_time: row.timertime,
+            increment: row.timerinc,
             rating_white: if row.rating_white == 0 {
                 None
             } else {
@@ -970,16 +889,8 @@ impl TryFrom<GameRow> for PlaytakGame {
             } else {
                 Some(row.rating_black)
             },
-            is_rated: match row.unrated {
-                0 => true,
-                1 => false,
-                _ => return Err(()),
-            },
-            is_tournament: match row.tournament {
-                0 => false,
-                1 => true,
-                _ => return Err(()),
-            },
+            is_rated: !row.unrated,
+            is_tournament: row.tournament,
             komi: Komi::from_half_komi(row.komi.try_into().map_err(|_| ())?).ok_or(())?,
             flats: if row.pieces == -1 {
                 position::starting_stones(row.size as usize) as i64
@@ -990,16 +901,6 @@ impl TryFrom<GameRow> for PlaytakGame {
                 position::starting_capstones(row.size as usize) as i64
             } else {
                 row.capstones
-            },
-            rating_change_white: if row.rating_change_white <= -1000 {
-                None
-            } else {
-                Some(row.rating_change_white)
-            },
-            rating_change_black: if row.rating_change_black <= -1000 {
-                None
-            } else {
-                Some(row.rating_change_black)
             },
         })
     }
@@ -1016,41 +917,22 @@ fn parse_notation<const S: usize>(notation: &str) -> Vec<Move> {
     }
 }
 
-#[derive(sqlx::FromRow, Debug, Clone)]
+#[derive(Debug)]
 struct GameRow {
-    id: i64,
-    date: i64,
-    size: i64,
+    id: u32,
+    date: DateTime<Utc>,
+    size: u8,
     player_white: String,
     player_black: String,
     notation: String,
     result: String,
-    timertime: i64,
-    timerinc: i64,
+    timertime: Duration,
+    timerinc: Duration,
     rating_white: i64,
     rating_black: i64,
-    unrated: i64,
-    tournament: i64,
-    komi: i64,
+    unrated: bool,
+    tournament: bool,
+    komi: u8,
     pieces: i64,
     capstones: i64,
-    rating_change_white: i64,
-    rating_change_black: i64,
-}
-
-struct SimpleGameRow {
-    id: i64,
-    date: i64,
-    size: i64,
-    player_white: String,
-    player_black: String,
-    notation: String,
-    result: String,
-    timertime: i64,
-    timerinc: i64,
-    rating_white: i64,
-    ratiing_black: i64,
-    unrated: i64,
-    tournament: i64,
-    komi: i64,
 }
