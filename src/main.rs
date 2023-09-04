@@ -130,6 +130,8 @@ fn main() {
             tiltak_second_move_eval	REAL NOT NULL,
             tinue_length INTEGER,
             tinue_avoidance_length INTEGER,
+            tiltak_pv_length INTEGER NOT NULL,
+            tiltak_second_pv_length INTEGER NOT NULL,
             FOREIGN KEY(game_id) REFERENCES games(id)
             )",
             [],
@@ -244,11 +246,13 @@ fn store_puzzle(puzzles_pool: &mut rusqlite::Connection, puzzle: Puzzle) {
         solution,
         tiltak_eval,
         tiltak_second_move_eval,
+        tiltak_pv_length,
+        tiltak_second_pv_length,
         tinue_length,
         tinue_avoidance_length,
     } = puzzle;
 
-    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params![
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_pv_length, tiltak_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", rusqlite::params![
         game_id as u32,
         tps.clone(),
         solution.clone(),
@@ -256,6 +260,8 @@ fn store_puzzle(puzzles_pool: &mut rusqlite::Connection, puzzle: Puzzle) {
         tiltak_second_move_eval,
         tinue_length,
         tinue_avoidance_length,
+        tiltak_pv_length,
+        tiltak_second_pv_length,
     ]) {
         if err.code == ErrorCode::ConstraintViolation {
             println!(
@@ -320,6 +326,11 @@ fn generate_possible_puzzle<'a, const S: usize>(
         if position.game_result().is_some() {
             return None;
         }
+        // Tinue is only possible after white has played S - 2 moves
+        if position.half_moves_played() <= (S - 2) * 2 {
+            return None;
+        }
+
         let tps = position.to_fen();
 
         let tiltak_analysis_shallow = {
@@ -438,6 +449,8 @@ struct Puzzle {
     solution: String,
     tiltak_eval: f32,
     tiltak_second_move_eval: f32,
+    tiltak_pv_length: u32,
+    tiltak_second_pv_length: u32,
     tinue_length: Option<u32>,
     tinue_avoidance_length: Option<u32>,
 }
@@ -468,15 +481,17 @@ impl PossiblePuzzle {
                 .unwrap_or_default(),
             tiltak_eval: tiltak_eval.score_first,
             tiltak_second_move_eval: tiltak_eval.score_second,
+            tiltak_pv_length: tiltak_eval.pv_first.len() as u32,
+            tiltak_second_pv_length: tiltak_eval.pv_second.len() as u32,
             tinue_length: None,
             tinue_avoidance_length: None,
         };
         if let TopazResult::Tinue(moves) = &self.topaz_tinue {
-            puzzle.tinue_length = Some(moves.len() as u32);
+            puzzle.tinue_length = Some(moves.len() as u32 + 1);
             puzzle.solution = moves[0].to_string::<S>();
         }
         if let Some(TopazAvoidanceResult::Defence(tinue_avoidance)) = &self.topaz_tinue_avoidance {
-            puzzle.tinue_avoidance_length = Some(tinue_avoidance.longest_refutation_length);
+            puzzle.tinue_avoidance_length = Some(tinue_avoidance.longest_refutation_length + 2);
             puzzle.solution = tinue_avoidance.defense.to_string::<S>();
         }
         Some(puzzle)
