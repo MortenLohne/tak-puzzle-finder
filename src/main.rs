@@ -1,12 +1,15 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
-use std::{sync::Mutex, time::Duration};
 
-use rayon::prelude::*;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+
+use async_channel::Receiver;
 use sqlx::sqlite::SqliteConnectOptions;
-use tokio::task;
+use tokio::{runtime, task};
 
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -23,8 +26,18 @@ const TOPAZ_FIRST_MOVE_NODES: usize = 5_000_000;
 const TOPAZ_SECOND_MOVE_NODES: usize = 10_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 1_000_000;
 
-#[tokio::main]
-async fn main() -> Result<(), sqlx::Error> {
+fn main() {
+    let runtime = runtime::Builder::new_multi_thread()
+        .global_queue_interval(1)
+        .disable_lifo_slot()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async { real_main().await.unwrap() });
+}
+
+// #[tokio::main(flavor = "multi_thread", worker_threads = 24)]
+async fn real_main() -> Result<(), sqlx::Error> {
     // Create a connection pool
     //  for MySQL, use MySqlPoolOptions::new()
     //  for SQLite, use SqlitePoolOptions::new()
@@ -42,7 +55,7 @@ async fn main() -> Result<(), sqlx::Error> {
 
     let games = read_non_bot_games(&mut db_conn).await.unwrap();
 
-    let relevant_games: Vec<PlaytakGame> = games
+    let mut relevant_games: Vec<PlaytakGame> = games
         .into_iter()
         .filter(|game| {
             game.size == 5
@@ -54,9 +67,13 @@ async fn main() -> Result<(), sqlx::Error> {
         })
         .collect();
 
+    relevant_games.shuffle(&mut thread_rng());
+
+    let (sender, receiver) = async_channel::bounded(1);
+
     let start_time = Instant::now();
-    let stats = Stats::default();
-    let games_processed = AtomicU64::new(0);
+    let stats = Arc::new(Stats::default());
+    let games_processed = Arc::new(AtomicU64::new(0));
 
     let puzzles_pool = SqlitePool::connect_with(
         SqliteConnectOptions::new()
@@ -81,69 +98,112 @@ async fn main() -> Result<(), sqlx::Error> {
     .await
     .unwrap();
 
-    let (puzzle_sender, puzzle_receiver) = mpsc::channel();
-    let (game_sender, game_receiver) = mpsc::channel();
+    let db_conn = Arc::new(tokio::sync::Mutex::new(db_conn));
+    let puzzles_pool = Arc::new(tokio::sync::Mutex::new(puzzles_pool));
+    let num_games = relevant_games.len();
+    let mut join_handles = vec![];
 
-    task::spawn_blocking(move || {
-        relevant_games.par_iter().for_each(|game| {
-            let mut has_been_aborted = false;
-            for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
-                if matches!(
-                    possible_puzzle.topaz_tinue,
-                    TopazResult::AbortedFirst | TopazResult::AbortedSecond(_)
-                ) || matches!(
-                    possible_puzzle.topaz_tinue_avoidance,
-                    Some(TopazAvoidanceResult::Aborted)
-                ) {
-                    has_been_aborted = true;
+    for _ in 0..24 {
+        let receiver: Receiver<PlaytakGame> = receiver.clone();
+        let stats = stats.clone();
+        let db_conn = db_conn.clone();
+        let puzzles_pool = puzzles_pool.clone();
+        let games_processed = games_processed.clone();
+
+        let handle = task::spawn(async move {
+            while let Ok(game) = receiver.recv().await {
+                let mut has_been_aborted = false;
+                for possible_puzzle in generate_possible_puzzle::<5>(&stats, &game) {
+                    if matches!(
+                        possible_puzzle.topaz_tinue,
+                        TopazResult::AbortedFirst | TopazResult::AbortedSecond(_)
+                    ) || matches!(
+                        possible_puzzle.topaz_tinue_avoidance,
+                        Some(TopazAvoidanceResult::Aborted)
+                    ) {
+                        has_been_aborted = true;
+                    }
+                    if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
+                        store_puzzle(&puzzles_pool, puzzle).await;
+                    }
                 }
-                if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
-                    puzzle_sender.send(puzzle).unwrap();
+
+                set_game_analyzed(&db_conn, game.id, has_been_aborted).await;
+
+                if games_processed.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
+                    println!(
+                        "Checked {}/{} games in {}s",
+                        games_processed.load(Ordering::SeqCst),
+                        num_games,
+                        start_time.elapsed().as_secs()
+                    );
+                    print!("Topaz tinue first move: ");
+                    stats.topaz_tinue_first.print_full();
+                    print!("Topaz tinue second move: ");
+                    stats.topaz_tinue_second.print_full();
+                    print!("Topaz tinue avoidance: ");
+                    stats.topaz_tinue_avoidance.print_full();
+                    print!("Tiltak non tinue (short): ");
+                    stats.tiltak_non_tinue_short.print_short();
+                    print!("Tiltak non tinue (long): ");
+                    stats.tiltak_non_tinue_long.print_short();
+                    print!("Tiltak tinue: ");
+                    stats.tiltak_tinue.print_short();
+                    println!();
                 }
             }
+        });
+        join_handles.push(handle);
+    }
+    for game in relevant_games {
+        sender.send(game).await.unwrap();
+    }
 
-            game_sender.send((game.id, has_been_aborted)).unwrap();
+    for handle in join_handles {
+        handle.await.unwrap();
+    }
+    Ok(())
+}
 
-            if games_processed.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
-                println!(
-                    "Checked {}/{} games in {}s",
-                    games_processed.load(Ordering::SeqCst),
-                    relevant_games.len(),
-                    start_time.elapsed().as_secs()
-                );
-                print!("Topaz tinue first move: ");
-                stats.topaz_tinue_first.print_full();
-                print!("Topaz tinue second move: ");
-                stats.topaz_tinue_second.print_full();
-                print!("Topaz tinue avoidance: ");
-                stats.topaz_tinue_avoidance.print_full();
-                print!("Tiltak non tinue (short): ");
-                stats.tiltak_non_tinue_short.print_short();
-                print!("Tiltak non tinue (long): ");
-                stats.tiltak_non_tinue_long.print_short();
-                print!("Tiltak tinue: ");
-                stats.tiltak_tinue.print_short();
-                println!();
-            }
-        })
-    });
+async fn set_game_analyzed(
+    db_conn: &tokio::sync::Mutex<SqliteConnection>,
+    game_id: u64,
+    has_been_aborted: bool,
+) {
+    let analyzed = if has_been_aborted { 2 } else { 1 };
 
-    task::spawn(async move {
-        loop {
-            let puzzle = puzzle_receiver.recv().unwrap();
-            let Puzzle {
-                game_id,
-                tps,
-                solution,
-                tiltak_eval,
-                tiltak_second_move_eval,
-                tinue_length,
-                tinue_avoidance_length,
-            } = puzzle;
+    let mut db_conn = db_conn.lock().await;
 
-            while let Err(err) =
-            sqlx::query(
-            "INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+    while let Err(err) = sqlx::query("UPDATE games SET has_been_analyzed = ?1 WHERE id = ?2")
+        .bind(analyzed)
+        .bind(game_id as u32)
+        .execute(&mut *db_conn)
+        .await
+    {
+        println!(
+            "Failed to update game #{} into DB. Retrying in 1s: {}",
+            game_id, err
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn store_puzzle(puzzles_pool: &tokio::sync::Mutex<SqlitePool>, puzzle: Puzzle) {
+    let Puzzle {
+        game_id,
+        tps,
+        solution,
+        tiltak_eval,
+        tiltak_second_move_eval,
+        tinue_length,
+        tinue_avoidance_length,
+    } = puzzle;
+
+    let puzzles_pool = puzzles_pool.lock().await;
+
+    while let Err(err) =
+    sqlx::query(
+    "INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         ).bind(game_id as u32)
         .bind(tps.clone())
         .bind(solution.clone())
@@ -151,36 +211,15 @@ async fn main() -> Result<(), sqlx::Error> {
         .bind(tiltak_second_move_eval)
         .bind(tinue_length)
         .bind(tinue_avoidance_length)
-        .execute(&puzzles_pool)
+        .execute(&*puzzles_pool)
         .await
-        {
-            if err.as_database_error().is_some_and(|db_err| db_err.is_unique_violation()) {
-                println!("Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}", tps, game_id, err);
-                break;
-            }
-            println!("Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}", tps, game_id, err);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    {
+        if err.as_database_error().is_some_and(|db_err| db_err.is_unique_violation()) {
+            println!("Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}", tps, game_id, err);
+            break;
         }
-        }
-    });
-
-    loop {
-        let (game_id, has_been_aborted) = game_receiver.recv().unwrap();
-
-        let analyzed = if has_been_aborted { 2 } else { 1 };
-
-        while let Err(err) = sqlx::query("UPDATE games SET has_been_analyzed = ?1 WHERE id = ?2")
-            .bind(analyzed)
-            .bind(game_id as u32)
-            .execute(&mut db_conn)
-            .await
-        {
-            println!(
-                "Failed to update game #{} into DB. Retrying in 1s: {}",
-                game_id, err
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        println!("Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}", tps, game_id, err);
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -289,8 +328,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
                         .record(tiltak_start_time.elapsed());
                 }
             }
-            TopazResult::RoadWin => (),
-            TopazResult::NonUniqueTinue(_) => last_move_was_tinue = true,
+            TopazResult::RoadWin | TopazResult::NonUniqueTinue(_) => last_move_was_tinue = true,
             TopazResult::Tinue(_) => {
                 let tiltak_start_time = Instant::now();
                 let tiltak_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
@@ -519,8 +557,8 @@ struct Stats {
 
 #[derive(Default)]
 struct TimeTracker {
-    times: Mutex<BTreeSet<Duration>>,
-    total_time: Mutex<Duration>,
+    times: std::sync::Mutex<BTreeSet<Duration>>,
+    total_time: std::sync::Mutex<Duration>,
 }
 
 impl TimeTracker {
@@ -995,4 +1033,21 @@ struct GameRow {
     capstones: i64,
     rating_change_white: i64,
     rating_change_black: i64,
+}
+
+struct SimpleGameRow {
+    id: i64,
+    date: i64,
+    size: i64,
+    player_white: String,
+    player_black: String,
+    notation: String,
+    result: String,
+    timertime: i64,
+    timerinc: i64,
+    rating_white: i64,
+    ratiing_black: i64,
+    unrated: i64,
+    tournament: i64,
+    komi: i64,
 }
