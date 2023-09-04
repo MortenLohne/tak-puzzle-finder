@@ -19,11 +19,11 @@ use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
 
 const TILTAK_SHALLOW_NODES: u32 = 50_000;
-const TILTAK_DEEP_NODES: u32 = 1_000_000;
+const TILTAK_DEEP_NODES: u32 = 2_000_000;
 
-const TOPAZ_FIRST_MOVE_NODES: usize = 5_000_000;
-const TOPAZ_SECOND_MOVE_NODES: usize = 10_000_000;
-const TOPAZ_AVOIDANCE_NODES: usize = 1_000_000;
+const TOPAZ_FIRST_MOVE_NODES: usize = 10_000_000;
+const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
+const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 fn main() {
     // Create a connection pool
@@ -107,7 +107,8 @@ fn main() {
                         _ => unimplemented!(),
                     };
                     moves
-                }),
+                })
+                .trim(),
             game.result_string,
             game.game_time.as_secs(),
             game.increment.as_secs(),
@@ -186,7 +187,7 @@ fn main() {
 
             set_game_analyzed(puzzle_conn, game.id);
 
-            if games_processed.fetch_add(1, Ordering::SeqCst) % 10 == 0 {
+            if games_processed.fetch_add(1, Ordering::SeqCst) % 200 == 0 {
                 println!(
                     "Checked {}/{} games in {}s",
                     games_processed.load(Ordering::SeqCst),
