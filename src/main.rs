@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pgn_traits::PgnPosition;
-use rusqlite::ErrorCode;
+use rusqlite::{Connection, ErrorCode};
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -30,18 +30,7 @@ fn main() {
     //  for MySQL, use MySqlPoolOptions::new()
     //  for SQLite, use SqlitePoolOptions::new()
     //  etc.
-    let mut db_conn = rusqlite::Connection::open("games_anon.db").unwrap();
-
-    match db_conn.execute(
-        "ALTER TABLE games ADD has_been_analyzed INTEGER DEFAULT 0",
-        [],
-    ) {
-        Ok(_) => (),
-        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-            if message.starts_with("duplicate column name") => {}
-
-        Err(err) => panic!("{}", err),
-    }
+    let mut db_conn = Connection::open("games_anon.db").unwrap();
 
     let games = read_non_bot_games(&mut db_conn).unwrap();
 
@@ -52,17 +41,18 @@ fn main() {
                 && game.moves.len() > 4
                 && !game.is_bot_game()
                 && game.game_is_legal()
-                && game.has_standard_piececount()
+                && game.has_standard_piece_count()
         })
         .collect();
 
     relevant_games.shuffle(&mut thread_rng());
+    let num_games = relevant_games.len();
 
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
     let games_processed = Arc::new(AtomicU64::new(0));
 
-    let puzzles_pool = rusqlite::Connection::open("puzzles.db").unwrap();
+    let puzzles_pool = Connection::open("puzzles.db").unwrap();
 
     puzzles_pool
         .execute(
@@ -91,6 +81,10 @@ fn main() {
             id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi, has_been_analyzed)
             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)").unwrap();
 
+    println!(
+        "Copying {} games from the input database. This may take a few minutes.",
+        num_games
+    );
     for game in relevant_games.iter() {
         stmt.execute(rusqlite::params![
             game.id,
@@ -151,12 +145,35 @@ fn main() {
         )
         .unwrap();
 
-    let num_games = relevant_games.len();
+    puzzles_pool
+        .execute(
+            "CREATE TABLE IF NOT EXISTS topaz_missed_tinues (
+            game_id	INTEGER NOT NULL,
+            tps	TEXT PRIMARY KEY,
+            FOREIGN KEY(game_id) REFERENCES games(id)
+            )",
+            [],
+        )
+        .unwrap();
 
     relevant_games.par_iter().for_each_init(
-        || rusqlite::Connection::open("puzzles.db").unwrap(),
+        || Connection::open("puzzles.db").unwrap(),
         |puzzle_conn, game| {
             for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
+                if let Some(TopazAvoidanceResult::NoDefense) = possible_puzzle.topaz_tinue_avoidance
+                {
+                    if !possible_puzzle.last_move_was_tinue {
+                        println!(
+                            "Found tinue not identified by Topaz, {} in game #{}",
+                            possible_puzzle.previous_tps, game.id
+                        );
+                        store_topaz_missed_tinues(
+                            puzzle_conn,
+                            game.id as u32,
+                            &possible_puzzle.previous_tps,
+                        );
+                    }
+                }
                 if let TopazResult::AbortedFirst = possible_puzzle.topaz_tinue {
                     store_failed_puzzle(
                         puzzle_conn,
@@ -214,7 +231,7 @@ fn main() {
     println!("Analysis complete");
 }
 
-fn set_game_analyzed(conn: &mut rusqlite::Connection, game_id: u64) {
+fn set_game_analyzed(conn: &mut Connection, game_id: u64) {
     while let Err(err) = conn.execute(
         "UPDATE games SET has_been_analyzed = 1 WHERE id = ?1",
         [game_id as u32],
@@ -227,12 +244,7 @@ fn set_game_analyzed(conn: &mut rusqlite::Connection, game_id: u64) {
     }
 }
 
-fn store_failed_puzzle(
-    conn: &mut rusqlite::Connection,
-    game_id: u32,
-    tps: &str,
-    failure_kind: &str,
-) {
+fn store_failed_puzzle(conn: &mut Connection, game_id: u32, tps: &str, failure_kind: &str) {
     conn.execute(
         "INSERT INTO failed_puzzles (game_id, tps, failure_kind) values (?1, ?2, ?3)",
         rusqlite::params![game_id, tps, failure_kind],
@@ -240,7 +252,15 @@ fn store_failed_puzzle(
     .unwrap();
 }
 
-fn store_puzzle(puzzles_pool: &mut rusqlite::Connection, puzzle: Puzzle) {
+fn store_topaz_missed_tinues(conn: &mut Connection, game_id: u32, tps: &str) {
+    conn.execute(
+        "INSERT INTO topaz_missed_tinues (game_id, tps) values (?1, ?2)",
+        rusqlite::params![game_id, tps],
+    )
+    .unwrap();
+}
+
+fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
     let Puzzle {
         game_id,
         tps,
@@ -279,7 +299,7 @@ fn store_puzzle(puzzles_pool: &mut rusqlite::Connection, puzzle: Puzzle) {
     }
 }
 
-fn read_non_bot_games(conn: &mut rusqlite::Connection) -> Option<Vec<PlaytakGame>> {
+fn read_non_bot_games(conn: &mut Connection) -> Option<Vec<PlaytakGame>> {
     let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi, pieces, capstones FROM games
         WHERE NOT instr(player_white, \"Bot\") 
         AND NOT instr(player_black, \"Bot\") 
@@ -369,7 +389,10 @@ fn generate_possible_puzzle<'a, const S: usize>(
             topaz_tinue_avoidance: None,
             tiltak_analysis_shallow: tiltak_analysis_shallow.clone(),
             tiltak_analysis_deep: None,
+            last_move_was_tinue,
         };
+
+        last_move_was_tinue = false;
 
         // If we have at least one half-decent move, check for tinue avoidance puzzle
         if tiltak_analysis_shallow.score_first > 0.1
@@ -382,23 +405,14 @@ fn generate_possible_puzzle<'a, const S: usize>(
             let tinue_avoidance = topaz_tinue_avoidance(&mut position, &tiltak_analysis_shallow);
             stats.topaz_tinue_avoidance.record(start_time.elapsed());
 
-            if !last_move_was_tinue && matches!(tinue_avoidance, TopazAvoidanceResult::NoDefense) {
-                println!(
-                    "Found tinue not identified by Topaz, {} in game #{}",
-                    possible_puzzle.previous_tps, game.id
-                );
-            }
-
             possible_puzzle.topaz_tinue_avoidance = Some(tinue_avoidance);
         };
-
-        last_move_was_tinue = false;
 
         match topaz_result {
             TopazResult::NoTinue | TopazResult::AbortedFirst | TopazResult::AbortedSecond(_) => {
                 if matches!(
                     possible_puzzle.topaz_tinue_avoidance,
-                    Some(TopazAvoidanceResult::Defence(_))
+                    Some(TopazAvoidanceResult::Defense(_))
                 ) || tiltak_analysis_shallow.score_first > 0.4
                     && tiltak_analysis_shallow.score_second < 0.6
                     && tiltak_analysis_shallow.score_first - tiltak_analysis_shallow.score_second
@@ -467,6 +481,7 @@ struct PossiblePuzzle {
     topaz_tinue_avoidance: Option<TopazAvoidanceResult>,
     tiltak_analysis_shallow: TiltakResult,
     tiltak_analysis_deep: Option<TiltakResult>,
+    last_move_was_tinue: bool,
 }
 
 impl PossiblePuzzle {
@@ -491,7 +506,7 @@ impl PossiblePuzzle {
             puzzle.tinue_length = Some(moves.len() as u32 + 1);
             puzzle.solution = moves[0].to_string::<S>();
         }
-        if let Some(TopazAvoidanceResult::Defence(tinue_avoidance)) = &self.topaz_tinue_avoidance {
+        if let Some(TopazAvoidanceResult::Defense(tinue_avoidance)) = &self.topaz_tinue_avoidance {
             puzzle.tinue_avoidance_length = Some(tinue_avoidance.longest_refutation_length + 2);
             puzzle.solution = tinue_avoidance.defense.to_string::<S>();
         }
@@ -638,39 +653,39 @@ fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult {
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
         .quiet()
         .limit(TOPAZ_FIRST_MOVE_NODES);
-    let is_tinue = first_tinue_search.is_tinue();
+    let result = first_tinue_search.is_tinue();
     stats.topaz_tinue_first.record(start_time.elapsed());
 
-    if first_tinue_search.aborted() {
-        return TopazResult::AbortedFirst;
-    }
-    if is_tinue == Some(true) {
-        let pv = first_tinue_search.principal_variation();
-        let tiltak_pv = pv
-            .iter()
-            .map(|mv| Move::from_string::<5>(mv.to_ptn::<Board5>().trim_end_matches('*')).unwrap())
-            .collect();
-        if !pv.is_empty() {
-            let start_time = Instant::now();
-            let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
-                .quiet()
-                .limit(TOPAZ_SECOND_MOVE_NODES)
-                .exclude(pv[0]);
-            second_tinue_search.is_tinue();
-            stats.topaz_tinue_second.record(start_time.elapsed());
+    match result {
+        None => TopazResult::AbortedFirst,
+        Some(false) => TopazResult::NoTinue,
+        Some(true) => {
+            let pv = first_tinue_search.principal_variation();
+            let tiltak_pv = pv
+                .iter()
+                .map(|mv| {
+                    Move::from_string::<5>(mv.to_ptn::<Board5>().trim_end_matches('*')).unwrap()
+                })
+                .collect();
+            if !pv.is_empty() {
+                let start_time = Instant::now();
+                let mut second_tinue_search = topaz_tak::search::proof::TinueSearch::new(board)
+                    .quiet()
+                    .limit(TOPAZ_SECOND_MOVE_NODES)
+                    .exclude(pv[0]);
 
-            if second_tinue_search.aborted() {
-                TopazResult::AbortedSecond(tiltak_pv)
-            } else if second_tinue_search.is_tinue() == Some(false) {
-                TopazResult::Tinue(tiltak_pv)
+                let result = second_tinue_search.is_tinue();
+                stats.topaz_tinue_second.record(start_time.elapsed());
+
+                match result {
+                    Some(true) => TopazResult::NonUniqueTinue(tiltak_pv),
+                    Some(false) => TopazResult::Tinue(tiltak_pv),
+                    None => TopazResult::AbortedSecond(tiltak_pv),
+                }
             } else {
-                TopazResult::NonUniqueTinue(tiltak_pv)
+                TopazResult::RoadWin
             }
-        } else {
-            TopazResult::RoadWin
         }
-    } else {
-        TopazResult::NoTinue
     }
 }
 
@@ -719,9 +734,9 @@ fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult {
 #[derive(Clone)]
 enum TopazAvoidanceResult {
     Aborted,
-    MultipleDefences,
+    MultipleDefenses,
     NoDefense,
-    Defence(TinueAvoidance),
+    Defense(TinueAvoidance),
 }
 
 fn topaz_tinue_avoidance<const S: usize>(
@@ -742,6 +757,7 @@ fn topaz_tinue_avoidance<const S: usize>(
     legal_moves.swap(0, index_first);
     legal_moves.swap(1, index_second);
 
+    let mut has_aborted = false;
     let mut defense = None;
     let mut refutations = vec![];
     let mut longest_refutation_length = 0;
@@ -753,27 +769,27 @@ fn topaz_tinue_avoidance<const S: usize>(
         let mut tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
             .quiet()
             .limit(TOPAZ_AVOIDANCE_NODES);
-        if tinue_search.aborted() {
-            return TopazAvoidanceResult::Aborted;
-        }
-        if tinue_search.is_tinue() != Some(true) {
-            if defense.is_some() {
-                return TopazAvoidanceResult::MultipleDefences;
+        match tinue_search.is_tinue() {
+            None => has_aborted = false, // If search aborts in one child, we can still conclude `MultipleDefenses` if two other children are not tinue
+            Some(false) if defense.is_some() => return TopazAvoidanceResult::MultipleDefenses,
+            Some(false) => defense = Some(mv.clone()),
+            Some(true) => {
+                if let Some(response) = tinue_search
+                    .principal_variation()
+                    .get(0)
+                    .and_then(|mv| Move::from_string::<S>(&mv.to_ptn::<Board5>()).ok())
+                {
+                    refutations.push([mv.clone(), response]);
+                    longest_refutation_length = longest_refutation_length
+                        .max(tinue_search.principal_variation().len() as u32)
+                }
             }
-            defense = Some(mv.clone());
-        } else if let Some(response) = tinue_search
-            .principal_variation()
-            .get(0)
-            .and_then(|mv| Move::from_string::<S>(&mv.to_ptn::<Board5>()).ok())
-        {
-            refutations.push([mv.clone(), response]);
-            longest_refutation_length =
-                longest_refutation_length.max(tinue_search.principal_variation().len() as u32)
         }
     }
-
-    if let Some(mv) = defense {
-        TopazAvoidanceResult::Defence(TinueAvoidance {
+    if has_aborted {
+        TopazAvoidanceResult::Aborted
+    } else if let Some(mv) = defense {
+        TopazAvoidanceResult::Defense(TinueAvoidance {
             defense: mv,
             longest_refutation_length,
         })
@@ -803,7 +819,7 @@ struct PlaytakGame {
 }
 
 impl PlaytakGame {
-    pub fn has_standard_piececount(&self) -> bool {
+    pub fn has_standard_piece_count(&self) -> bool {
         position::starting_stones(self.size) as i64 == self.flats
             && position::starting_capstones(self.size) as i64 == self.caps
     }
