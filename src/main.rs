@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pgn_traits::PgnPosition;
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::Connection;
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -46,7 +46,6 @@ fn main() {
         .collect();
 
     relevant_games.shuffle(&mut thread_rng());
-    let num_games = relevant_games.len();
 
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
@@ -82,8 +81,8 @@ fn main() {
             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)").unwrap();
 
     println!(
-        "Copying {} games from the input database. This may take a few minutes.",
-        num_games
+        "Copying up to {} games from the input database. This may take a few minutes.",
+        relevant_games.len()
     );
     for game in relevant_games.iter() {
         stmt.execute(rusqlite::params![
@@ -156,6 +155,8 @@ fn main() {
         )
         .unwrap();
 
+    relevant_games = read_processed_games(&puzzles_pool);
+
     relevant_games.par_iter().for_each_init(
         || Connection::open("puzzles.db").unwrap(),
         |puzzle_conn, game| {
@@ -208,7 +209,7 @@ fn main() {
                 println!(
                     "Checked {}/{} games in {}s",
                     games_processed.load(Ordering::SeqCst),
-                    num_games,
+                    relevant_games.len(),
                     start_time.elapsed().as_secs()
                 );
                 print!("Topaz tinue first move: ");
@@ -246,7 +247,7 @@ fn set_game_analyzed(conn: &mut Connection, game_id: u64) {
 
 fn store_failed_puzzle(conn: &mut Connection, game_id: u32, tps: &str, failure_kind: &str) {
     conn.execute(
-        "INSERT INTO failed_puzzles (game_id, tps, failure_kind) values (?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO failed_puzzles (game_id, tps, failure_kind) values (?1, ?2, ?3)",
         rusqlite::params![game_id, tps, failure_kind],
     )
     .unwrap();
@@ -254,7 +255,7 @@ fn store_failed_puzzle(conn: &mut Connection, game_id: u32, tps: &str, failure_k
 
 fn store_topaz_missed_tinues(conn: &mut Connection, game_id: u32, tps: &str) {
     conn.execute(
-        "INSERT INTO topaz_missed_tinues (game_id, tps) values (?1, ?2)",
+        "INSERT OR IGNORE INTO topaz_missed_tinues (game_id, tps) values (?1, ?2)",
         rusqlite::params![game_id, tps],
     )
     .unwrap();
@@ -273,7 +274,7 @@ fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
         tinue_avoidance_length,
     } = puzzle;
 
-    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_pv_length, tiltak_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", rusqlite::params![
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_pv_length, tiltak_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", rusqlite::params![
         game_id as u32,
         tps.clone(),
         solution.clone(),
@@ -284,19 +285,82 @@ fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
         tiltak_pv_length,
         tiltak_second_pv_length,
     ]) {
-        if err.code == ErrorCode::ConstraintViolation {
-            println!(
-                "Failed to insert \"{}\" from game ${} into DB due to uniqueness constraint: {}",
-                tps, game_id, err
-            );
-            break;
-        }
         println!(
             "Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}",
             tps, game_id, err
         );
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn read_processed_games(conn: &Connection) -> Vec<PlaytakGame> {
+    let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi FROM games
+        WHERE has_been_analyzed = 0")
+    .unwrap();
+    let rows = stmt.query([]).unwrap().mapped(|row| {
+        Ok(GameRow {
+            id: row.get(0).unwrap(),
+            date: row.get(1).unwrap(),
+            size: row.get(2).unwrap(),
+            player_white: row.get(3).unwrap(),
+            player_black: row.get(4).unwrap(),
+            notation: row.get(5).unwrap(),
+            result: row.get(6).unwrap(),
+            timertime: Duration::from_secs(row.get(7).unwrap()),
+            timerinc: Duration::from_secs(row.get(8).unwrap()),
+            rating_white: row.get(9).unwrap(),
+            rating_black: row.get(10).unwrap(),
+            unrated: row.get(11).unwrap(),
+            tournament: row.get(12).unwrap(),
+            komi: row.get(13).unwrap(),
+            pieces: position::starting_stones(row.get(2).unwrap()) as i64,
+            capstones: position::starting_capstones(row.get(2).unwrap()) as i64,
+        })
+    });
+
+    rows.map(|row| {
+        let row = row.unwrap();
+        let moves = match row.size {
+            5 => row
+                .notation
+                .split_whitespace()
+                .map(|s| Move::from_string::<5>(s).unwrap())
+                .collect(),
+            6 => row
+                .notation
+                .split_whitespace()
+                .map(|s| Move::from_string::<6>(s).unwrap())
+                .collect(),
+            _ => unimplemented!(),
+        };
+        PlaytakGame {
+            id: row.id as u64,
+            date_time: row.date,
+            size: row.size as usize,
+            player_white: row.player_white,
+            player_black: row.player_black,
+            moves,
+            result_string: row.result,
+            game_time: row.timertime,
+            increment: row.timerinc,
+            rating_white: if row.rating_white == 0 {
+                None
+            } else {
+                Some(row.rating_white)
+            },
+            rating_black: if row.rating_black == 0 {
+                None
+            } else {
+                Some(row.rating_black)
+            },
+            is_rated: !row.unrated,
+            is_tournament: row.tournament,
+            komi: Komi::from_half_komi(row.komi as i8).unwrap(),
+            flats: row.pieces,
+            caps: row.capstones,
+        }
+    })
+    .collect()
 }
 
 fn read_non_bot_games(conn: &mut Connection) -> Option<Vec<PlaytakGame>> {
@@ -770,7 +834,7 @@ fn topaz_tinue_avoidance<const S: usize>(
             .quiet()
             .limit(TOPAZ_AVOIDANCE_NODES);
         match tinue_search.is_tinue() {
-            None => has_aborted = false, // If search aborts in one child, we can still conclude `MultipleDefenses` if two other children are not tinue
+            None => has_aborted = true, // If search aborts in one child, we can still conclude `MultipleDefenses` if two other children are not tinue
             Some(false) if defense.is_some() => return TopazAvoidanceResult::MultipleDefenses,
             Some(false) => defense = Some(mv.clone()),
             Some(true) => {
