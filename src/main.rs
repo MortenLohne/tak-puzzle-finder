@@ -120,12 +120,16 @@ fn main() {
             game_id	INTEGER NOT NULL,
             tps	TEXT PRIMARY KEY,
             solution TEXT NOT NULL,
-            tiltak_eval	REAL NOT NULL,
-            tiltak_second_move_eval	REAL NOT NULL,
+            tiltak_0komi_eval REAL NOT NULL,
+            tiltak_2komi_eval REAL NOT NULL,
+            tiltak_0komi_second_move_eval REAL NOT NULL,
+            tiltak_2komi_second_move_eval REAL NOT NULL,
             tinue_length INTEGER,
             tinue_avoidance_length INTEGER,
-            tiltak_pv_length INTEGER NOT NULL,
-            tiltak_second_pv_length INTEGER NOT NULL,
+            tiltak_0komi_pv_length INTEGER NOT NULL,
+            tiltak_2komi_pv_length INTEGER NOT NULL,
+            tiltak_0komi_second_pv_length INTEGER NOT NULL,
+            tiltak_2komi_second_pv_length INTEGER NOT NULL,
             FOREIGN KEY(game_id) REFERENCES games(id)
             )",
             [],
@@ -266,24 +270,32 @@ fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
         game_id,
         tps,
         solution,
-        tiltak_eval,
-        tiltak_second_move_eval,
-        tiltak_pv_length,
-        tiltak_second_pv_length,
+        tiltak_0komi_eval,
+        tiltak_2komi_eval,
+        tiltak_0komi_second_move_eval,
+        tiltak_2komi_second_move_eval,
+        tiltak_0komi_pv_length,
+        tiltak_2komi_pv_length,
+        tiltak_0komi_second_pv_length,
+        tiltak_2komi_second_pv_length,
         tinue_length,
         tinue_avoidance_length,
     } = puzzle;
 
-    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles (game_id, tps, solution, tiltak_eval, tiltak_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_pv_length, tiltak_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", rusqlite::params![
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles (game_id, tps, solution, tiltak_0komi_eval, tiltak_2komi_eval, tiltak_0komi_second_move_eval, tiltak_2komi_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_0komi_pv_length, tiltak_2komi_pv_length, tiltak_0komi_second_pv_length, tiltak_2komi_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)", rusqlite::params![
         game_id as u32,
         tps.clone(),
         solution.clone(),
-        tiltak_eval,
-        tiltak_second_move_eval,
+        tiltak_0komi_eval,
+        tiltak_2komi_eval,
+        tiltak_0komi_second_move_eval,
+        tiltak_2komi_second_move_eval,
         tinue_length,
         tinue_avoidance_length,
-        tiltak_pv_length,
-        tiltak_second_pv_length,
+        tiltak_0komi_pv_length,
+        tiltak_2komi_pv_length,
+        tiltak_0komi_second_pv_length,
+        tiltak_2komi_second_pv_length,
     ]) {
         println!(
             "Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}",
@@ -417,10 +429,21 @@ fn generate_possible_puzzle<'a, const S: usize>(
         }
 
         let tps = position.to_fen();
+        let mut komi_position = position.clone();
+        komi_position.set_komi(Komi::from_half_komi(4).unwrap());
 
-        let tiltak_analysis_shallow = {
+        let tiltak_0komi_analysis_shallow = {
             let start_time = Instant::now();
             let result = tiltak_search(position.clone(), TILTAK_SHALLOW_NODES);
+
+            stats.tiltak_non_tinue_short.record(start_time.elapsed());
+
+            result
+        };
+
+        let tiltak_2komi_analysis_shallow = {
+            let start_time = Instant::now();
+            let result = tiltak_search(komi_position.clone(), TILTAK_SHALLOW_NODES);
 
             stats.tiltak_non_tinue_short.record(start_time.elapsed());
 
@@ -451,22 +474,24 @@ fn generate_possible_puzzle<'a, const S: usize>(
             followup_move: None,
             topaz_tinue: topaz_result.clone(),
             topaz_tinue_avoidance: None,
-            tiltak_analysis_shallow: tiltak_analysis_shallow.clone(),
-            tiltak_analysis_deep: None,
+            tiltak_0komi_analysis_deep: None,
+            tiltak_2komi_analysis_deep: None,
             last_move_was_tinue,
         };
 
         last_move_was_tinue = false;
 
         // If we have at least one half-decent move, check for tinue avoidance puzzle
-        if tiltak_analysis_shallow.score_first > 0.1
+        if (tiltak_0komi_analysis_shallow.score_first > 0.1
+            || tiltak_2komi_analysis_shallow.score_first > 0.1)
             && !matches!(
                 topaz_result,
                 TopazResult::RoadWin | TopazResult::NonUniqueTinue(_)
             )
         {
             let start_time = Instant::now();
-            let tinue_avoidance = topaz_tinue_avoidance(&mut position, &tiltak_analysis_shallow);
+            let tinue_avoidance =
+                topaz_tinue_avoidance(&mut position, &tiltak_0komi_analysis_shallow);
             stats.topaz_tinue_avoidance.record(start_time.elapsed());
 
             possible_puzzle.topaz_tinue_avoidance = Some(tinue_avoidance);
@@ -477,15 +502,19 @@ fn generate_possible_puzzle<'a, const S: usize>(
                 if matches!(
                     possible_puzzle.topaz_tinue_avoidance,
                     Some(TopazAvoidanceResult::Defense(_))
-                ) || tiltak_analysis_shallow.score_first > 0.4
-                    && tiltak_analysis_shallow.score_second < 0.6
-                    && tiltak_analysis_shallow.score_first - tiltak_analysis_shallow.score_second
-                        > 0.3
+                ) || tiltak_0komi_analysis_shallow.is_puzzle_candidate()
+                    || tiltak_2komi_analysis_shallow.is_puzzle_candidate()
                 {
                     let tiltak_start_time = Instant::now();
-                    let tiltak_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+                    let tiltak_0komi_analysis_deep =
+                        tiltak_search(position.clone(), TILTAK_DEEP_NODES);
 
-                    possible_puzzle.tiltak_analysis_deep = Some(tiltak_analysis_deep);
+                    possible_puzzle.tiltak_0komi_analysis_deep = Some(tiltak_0komi_analysis_deep);
+
+                    let tiltak_2komi_analysis_deep =
+                        tiltak_search(komi_position.clone(), TILTAK_DEEP_NODES);
+
+                    possible_puzzle.tiltak_2komi_analysis_deep = Some(tiltak_2komi_analysis_deep);
 
                     stats
                         .tiltak_non_tinue_long
@@ -495,9 +524,14 @@ fn generate_possible_puzzle<'a, const S: usize>(
             TopazResult::RoadWin | TopazResult::NonUniqueTinue(_) => last_move_was_tinue = true,
             TopazResult::Tinue(_) => {
                 let tiltak_start_time = Instant::now();
-                let tiltak_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+                let tiltak_0komi_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
 
-                possible_puzzle.tiltak_analysis_deep = Some(tiltak_analysis_deep);
+                possible_puzzle.tiltak_0komi_analysis_deep = Some(tiltak_0komi_analysis_deep);
+
+                let tiltak_2komi_analysis_deep =
+                    tiltak_search(komi_position.clone(), TILTAK_DEEP_NODES);
+
+                possible_puzzle.tiltak_2komi_analysis_deep = Some(tiltak_2komi_analysis_deep);
 
                 stats.tiltak_tinue.record(tiltak_start_time.elapsed());
 
@@ -526,10 +560,14 @@ struct Puzzle {
     game_id: u64,
     tps: String,
     solution: String,
-    tiltak_eval: f32,
-    tiltak_second_move_eval: f32,
-    tiltak_pv_length: u32,
-    tiltak_second_pv_length: u32,
+    tiltak_0komi_eval: f32,
+    tiltak_0komi_second_move_eval: f32,
+    tiltak_0komi_pv_length: u32,
+    tiltak_0komi_second_pv_length: u32,
+    tiltak_2komi_eval: f32,
+    tiltak_2komi_second_move_eval: f32,
+    tiltak_2komi_pv_length: u32,
+    tiltak_2komi_second_pv_length: u32,
     tinue_length: Option<u32>,
     tinue_avoidance_length: Option<u32>,
 }
@@ -543,26 +581,31 @@ struct PossiblePuzzle {
     followup_move: Option<Move>,
     topaz_tinue: TopazResult,
     topaz_tinue_avoidance: Option<TopazAvoidanceResult>,
-    tiltak_analysis_shallow: TiltakResult,
-    tiltak_analysis_deep: Option<TiltakResult>,
+    tiltak_0komi_analysis_deep: Option<TiltakResult>,
+    tiltak_2komi_analysis_deep: Option<TiltakResult>,
     last_move_was_tinue: bool,
 }
 
 impl PossiblePuzzle {
     fn make_real_puzzle<const S: usize>(&self) -> Option<Puzzle> {
-        let tiltak_eval = self.tiltak_analysis_deep.as_ref()?;
+        let tiltak_0komi_eval = self.tiltak_0komi_analysis_deep.as_ref()?;
+        let tiltak_2komi_eval = self.tiltak_2komi_analysis_deep.as_ref()?;
         let mut puzzle = Puzzle {
             game_id: self.playtak_game.id,
             tps: self.tps.clone(),
-            solution: tiltak_eval
+            solution: tiltak_0komi_eval
                 .pv_first
                 .first()
                 .map(|mv| mv.to_string::<S>())
                 .unwrap_or_default(),
-            tiltak_eval: tiltak_eval.score_first,
-            tiltak_second_move_eval: tiltak_eval.score_second,
-            tiltak_pv_length: tiltak_eval.pv_first.len() as u32,
-            tiltak_second_pv_length: tiltak_eval.pv_second.len() as u32,
+            tiltak_0komi_eval: tiltak_0komi_eval.score_first,
+            tiltak_0komi_second_move_eval: tiltak_0komi_eval.score_second,
+            tiltak_0komi_pv_length: tiltak_0komi_eval.pv_first.len() as u32,
+            tiltak_0komi_second_pv_length: tiltak_0komi_eval.pv_second.len() as u32,
+            tiltak_2komi_eval: tiltak_2komi_eval.score_first,
+            tiltak_2komi_second_move_eval: tiltak_2komi_eval.score_second,
+            tiltak_2komi_pv_length: tiltak_2komi_eval.pv_first.len() as u32,
+            tiltak_2komi_second_pv_length: tiltak_2komi_eval.pv_second.len() as u32,
             tinue_length: None,
             tinue_avoidance_length: None,
         };
@@ -644,6 +687,14 @@ struct TiltakResult {
     pv_first: Vec<Move>,
     score_second: f32,
     pv_second: Vec<Move>,
+}
+
+impl TiltakResult {
+    pub fn is_puzzle_candidate(&self) -> bool {
+        self.score_first > 0.4
+            && self.score_second < 0.6
+            && self.score_first - self.score_second > 0.3
+    }
 }
 
 fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakResult {
