@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -11,7 +12,7 @@ use rand::thread_rng;
 use rayon::prelude::*;
 
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use pgn_traits::PgnPosition;
 use rusqlite::Connection;
 use tiltak::position::{self, Komi, Move, Position};
@@ -26,6 +27,10 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 fn main() {
+    main_sized::<6>()
+}
+
+fn main_sized<const S: usize>() {
     // Create a connection pool
     //  for MySQL, use MySqlPoolOptions::new()
     //  for SQLite, use SqlitePoolOptions::new()
@@ -37,8 +42,8 @@ fn main() {
     let mut relevant_games: Vec<PlaytakGame> = games
         .into_iter()
         .filter(|game| {
-            game.size == 5
-                && game.moves.len() > 4
+            game.size == S
+                && game.notation.split_whitespace().count() > 4
                 && !game.is_bot_game()
                 && game.game_is_legal()
                 && game.has_standard_piece_count()
@@ -91,17 +96,7 @@ fn main() {
             game.size,
             game.player_white,
             game.player_black,
-            game.moves
-                .iter()
-                .fold(String::with_capacity(200), |mut moves, mv| {
-                    match game.size {
-                        5 => write!(moves, "{} ", mv.to_string::<5>()).unwrap(),
-                        6 => write!(moves, "{} ", mv.to_string::<6>()).unwrap(),
-                        _ => unimplemented!(),
-                    };
-                    moves
-                })
-                .trim(),
+            game.notation,
             game.result_string,
             game.game_time.as_secs(),
             game.increment.as_secs(),
@@ -159,12 +154,12 @@ fn main() {
         )
         .unwrap();
 
-    relevant_games = read_processed_games(&puzzles_pool);
+    relevant_games = read_processed_games::<S>(&puzzles_pool);
 
     relevant_games.par_iter().for_each_init(
         || Connection::open("puzzles.db").unwrap(),
         |puzzle_conn, game| {
-            for possible_puzzle in generate_possible_puzzle::<5>(&stats, game) {
+            for possible_puzzle in generate_possible_puzzle::<S>(&stats, game) {
                 if let Some(TopazAvoidanceResult::NoDefense) = possible_puzzle.topaz_tinue_avoidance
                 {
                     if !possible_puzzle.last_move_was_tinue {
@@ -202,7 +197,7 @@ fn main() {
                         &possible_puzzle.tps,
                         "Topaz timed out on tinue avoidance",
                     )
-                } else if let Some(puzzle) = possible_puzzle.make_real_puzzle::<5>() {
+                } else if let Some(puzzle) = possible_puzzle.make_real_puzzle() {
                     store_puzzle(puzzle_conn, puzzle);
                 }
             }
@@ -305,11 +300,11 @@ fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
     }
 }
 
-fn read_processed_games(conn: &Connection) -> Vec<PlaytakGame> {
+fn read_processed_games<const S: usize>(conn: &Connection) -> Vec<PlaytakGame> {
     let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi FROM games
-        WHERE has_been_analyzed = 0")
+        WHERE has_been_analyzed = 0 AND size = ?1")
     .unwrap();
-    let rows = stmt.query([]).unwrap().mapped(|row| {
+    let rows = stmt.query([S]).unwrap().mapped(|row| {
         Ok(GameRow {
             id: row.get(0).unwrap(),
             date: row.get(1).unwrap(),
@@ -332,26 +327,13 @@ fn read_processed_games(conn: &Connection) -> Vec<PlaytakGame> {
 
     rows.map(|row| {
         let row = row.unwrap();
-        let moves = match row.size {
-            5 => row
-                .notation
-                .split_whitespace()
-                .map(|s| Move::from_string::<5>(s).unwrap())
-                .collect(),
-            6 => row
-                .notation
-                .split_whitespace()
-                .map(|s| Move::from_string::<6>(s).unwrap())
-                .collect(),
-            _ => unimplemented!(),
-        };
         PlaytakGame {
             id: row.id as u64,
             date_time: row.date,
             size: row.size as usize,
             player_white: row.player_white,
             player_black: row.player_black,
-            moves,
+            notation: row.notation,
             result_string: row.result,
             game_time: row.timertime,
             increment: row.timerinc,
@@ -386,7 +368,9 @@ fn read_non_bot_games(conn: &mut Connection) -> Option<Vec<PlaytakGame>> {
         Ok(GameRow {
             id: row.get(0).unwrap(),
             date: DateTime::from_naive_utc_and_offset(
-                NaiveDateTime::from_timestamp_opt(row.get::<_, i64>(1).unwrap() / 1000, 0).unwrap(),
+                DateTime::from_timestamp(row.get::<_, i64>(1).unwrap() / 1000, 0)
+                    .unwrap()
+                    .naive_local(),
                 Utc,
             ),
             size: row.get(2).unwrap(),
@@ -412,14 +396,20 @@ fn read_non_bot_games(conn: &mut Connection) -> Option<Vec<PlaytakGame>> {
 fn generate_possible_puzzle<'a, const S: usize>(
     stats: &'a Stats,
     game: &'a PlaytakGame,
-) -> impl Iterator<Item = PossiblePuzzle> + 'a {
+) -> impl Iterator<Item = PossiblePuzzle<S>> + 'a {
+    assert_eq!(game.size, S);
     let mut position = <Position<S>>::start_position();
     let mut last_move_was_tinue = false;
+    let moves: Vec<Move<S>> = game
+        .notation
+        .split_whitespace()
+        .map(|mv| Move::from_string(mv).unwrap())
+        .collect();
 
-    game.moves.iter().filter_map(move |mv| {
+    moves.into_iter().filter_map(move |mv| {
         let last_tps = position.to_fen();
 
-        position.do_move(mv.clone());
+        position.do_move(mv);
         if position.game_result().is_some() {
             return None;
         }
@@ -453,7 +443,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
         let mut immediate_wins = vec![];
         position.generate_moves(&mut immediate_wins);
         immediate_wins.retain(|mv| {
-            let reverse_move = position.do_move(mv.clone());
+            let reverse_move = position.do_move(*mv);
             let is_win = match position.game_result() {
                 Some(GameResult::WhiteWin) if position.side_to_move() == Color::Black => true,
                 Some(GameResult::BlackWin) if position.side_to_move() == Color::White => true,
@@ -469,7 +459,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
             playtak_game: game.clone(),
             tps: tps.clone(),
             previous_tps: last_tps,
-            previous_move: mv.clone(),
+            previous_move: mv,
             immediate_wins,
             followup_move: None,
             topaz_tinue: topaz_result.clone(),
@@ -572,22 +562,22 @@ struct Puzzle {
     tinue_avoidance_length: Option<u32>,
 }
 
-struct PossiblePuzzle {
+struct PossiblePuzzle<const S: usize> {
     playtak_game: PlaytakGame,
     tps: String,
     previous_tps: String,
-    previous_move: Move,
-    immediate_wins: Vec<Move>,
-    followup_move: Option<Move>,
-    topaz_tinue: TopazResult,
-    topaz_tinue_avoidance: Option<TopazAvoidanceResult>,
-    tiltak_0komi_analysis_deep: Option<TiltakResult>,
-    tiltak_2komi_analysis_deep: Option<TiltakResult>,
+    previous_move: Move<S>,
+    immediate_wins: Vec<Move<S>>,
+    followup_move: Option<Move<S>>,
+    topaz_tinue: TopazResult<S>,
+    topaz_tinue_avoidance: Option<TopazAvoidanceResult<S>>,
+    tiltak_0komi_analysis_deep: Option<TiltakResult<S>>,
+    tiltak_2komi_analysis_deep: Option<TiltakResult<S>>,
     last_move_was_tinue: bool,
 }
 
-impl PossiblePuzzle {
-    fn make_real_puzzle<const S: usize>(&self) -> Option<Puzzle> {
+impl<const S: usize> PossiblePuzzle<S> {
+    fn make_real_puzzle(&self) -> Option<Puzzle> {
         let tiltak_0komi_eval = self.tiltak_0komi_analysis_deep.as_ref()?;
         let tiltak_2komi_eval = self.tiltak_2komi_analysis_deep.as_ref()?;
         let mut puzzle = Puzzle {
@@ -596,7 +586,7 @@ impl PossiblePuzzle {
             solution: tiltak_0komi_eval
                 .pv_first
                 .first()
-                .map(|mv| mv.to_string::<S>())
+                .map(|mv| mv.to_string())
                 .unwrap_or_default(),
             tiltak_0komi_eval: tiltak_0komi_eval.score_first,
             tiltak_0komi_second_move_eval: tiltak_0komi_eval.score_second,
@@ -611,19 +601,19 @@ impl PossiblePuzzle {
         };
         if let TopazResult::Tinue(moves) = &self.topaz_tinue {
             puzzle.tinue_length = Some(moves.len() as u32 + 1);
-            puzzle.solution = moves[0].to_string::<S>();
+            puzzle.solution = moves[0].to_string();
         }
         if let Some(TopazAvoidanceResult::Defense(tinue_avoidance)) = &self.topaz_tinue_avoidance {
             puzzle.tinue_avoidance_length = Some(tinue_avoidance.longest_refutation_length + 2);
-            puzzle.solution = tinue_avoidance.defense.to_string::<S>();
+            puzzle.solution = tinue_avoidance.defense.to_string();
         }
         Some(puzzle)
     }
 }
 
 #[derive(Clone)]
-struct TinueAvoidance {
-    defense: Move,
+struct TinueAvoidance<const S: usize> {
+    defense: Move<S>,
     longest_refutation_length: u32,
 }
 
@@ -682,14 +672,14 @@ impl TimeTracker {
 }
 
 #[derive(Debug, Clone)]
-struct TiltakResult {
+struct TiltakResult<const S: usize> {
     score_first: f32,
-    pv_first: Vec<Move>,
+    pv_first: Vec<Move<S>>,
     score_second: f32,
-    pv_second: Vec<Move>,
+    pv_second: Vec<Move<S>>,
 }
 
-impl TiltakResult {
+impl<const S: usize> TiltakResult<S> {
     pub fn is_puzzle_candidate(&self) -> bool {
         self.score_first > 0.4
             && self.score_second < 0.6
@@ -697,7 +687,7 @@ impl TiltakResult {
     }
 }
 
-fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakResult {
+fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakResult<S> {
     let settings1 = search::MctsSetting::default().arena_size_for_nodes(nodes);
     let mut tree1 = search::MonteCarloTree::with_settings(position.clone(), settings1);
     for _ in 0..nodes {
@@ -745,24 +735,34 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
 }
 
 #[derive(Clone)]
-enum TopazResult {
+enum TopazResult<const S: usize> {
     NoTinue,
     RoadWin,
-    Tinue(Vec<Move>),
+    Tinue(Vec<Move<S>>),
     AbortedFirst,
-    AbortedSecond(Vec<Move>),
-    NonUniqueTinue(Vec<Move>),
+    AbortedSecond(Vec<Move<S>>),
+    NonUniqueTinue(Vec<Move<S>>),
 }
 
-fn topaz_search<const S: usize>(tps: &str, stats: &Stats) -> TopazResult {
+impl<const S: usize> TopazResult<S> {
+    pub const fn downcast_size<const N: usize>(self) -> TopazResult<N> {
+        if S == N {
+            unsafe { mem::transmute(self) }
+        } else {
+            panic!()
+        }
+    }
+}
+
+fn topaz_search<const S: usize>(tps: &str, stats: &Stats) -> TopazResult<S> {
     match S {
-        5 => topaz_search_5s(tps, stats),
-        6 => topaz_search_6s(tps, stats),
+        5 => topaz_search_5s(tps, stats).downcast_size(),
+        6 => topaz_search_6s(tps, stats).downcast_size(),
         _ => unimplemented!(),
     }
 }
 
-fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult {
+fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult<5> {
     let board = topaz_tak::board::Board5::try_from_tps(tps).unwrap();
     let start_time = Instant::now();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
@@ -778,9 +778,7 @@ fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult {
             let pv = first_tinue_search.principal_variation();
             let tiltak_pv = pv
                 .iter()
-                .map(|mv| {
-                    Move::from_string::<5>(mv.to_ptn::<Board5>().trim_end_matches('*')).unwrap()
-                })
+                .map(|mv| Move::from_string(mv.to_ptn::<Board5>().trim_end_matches('*')).unwrap())
                 .collect();
             if !pv.is_empty() {
                 let start_time = Instant::now();
@@ -804,7 +802,7 @@ fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult {
     }
 }
 
-fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult {
+fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult<6> {
     let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
     let start_time = Instant::now();
     let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
@@ -820,7 +818,7 @@ fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult {
         let pv = first_tinue_search.principal_variation();
         let tiltak_pv = pv
             .iter()
-            .map(|mv| Move::from_string::<6>(mv.to_ptn::<Board6>().trim_end_matches('*')).unwrap())
+            .map(|mv| Move::from_string(mv.to_ptn::<Board6>().trim_end_matches('*')).unwrap())
             .collect();
         if !pv.is_empty() {
             let start_time = Instant::now();
@@ -847,17 +845,28 @@ fn topaz_search_6s(tps: &str, stats: &Stats) -> TopazResult {
 }
 
 #[derive(Clone)]
-enum TopazAvoidanceResult {
+enum TopazAvoidanceResult<const S: usize> {
     Aborted,
     MultipleDefenses,
     NoDefense,
-    Defense(TinueAvoidance),
+    Defense(TinueAvoidance<S>),
 }
 
 fn topaz_tinue_avoidance<const S: usize>(
     position: &mut Position<S>,
-    shallow_tiltak_analysis: &TiltakResult,
-) -> TopazAvoidanceResult {
+    shallow_tiltak_analysis: &TiltakResult<S>,
+) -> TopazAvoidanceResult<S> {
+    match S {
+        5 => topaz_tinue_avoidance_5s(position, shallow_tiltak_analysis),
+        6 => topaz_tinue_avoidance_6s(position, shallow_tiltak_analysis),
+        _ => unimplemented!(),
+    }
+}
+
+fn topaz_tinue_avoidance_5s<const S: usize>(
+    position: &mut Position<S>,
+    shallow_tiltak_analysis: &TiltakResult<S>,
+) -> TopazAvoidanceResult<S> {
     let mut legal_moves = vec![];
     position.generate_moves(&mut legal_moves);
     // Check Tiltak's suggested moves first, to save time
@@ -878,7 +887,7 @@ fn topaz_tinue_avoidance<const S: usize>(
     let mut longest_refutation_length = 0;
 
     for mv in legal_moves.iter() {
-        let reverse_move = position.do_move(mv.clone());
+        let reverse_move = position.do_move(*mv);
         let board: Board5 = topaz_tak::board::Board5::try_from_tps(&position.to_fen()).unwrap();
         position.reverse_move(reverse_move);
         let mut tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
@@ -887,14 +896,14 @@ fn topaz_tinue_avoidance<const S: usize>(
         match tinue_search.is_tinue() {
             None => has_aborted = true, // If search aborts in one child, we can still conclude `MultipleDefenses` if two other children are not tinue
             Some(false) if defense.is_some() => return TopazAvoidanceResult::MultipleDefenses,
-            Some(false) => defense = Some(mv.clone()),
+            Some(false) => defense = Some(mv),
             Some(true) => {
                 if let Some(response) = tinue_search
                     .principal_variation()
-                    .get(0)
-                    .and_then(|mv| Move::from_string::<S>(&mv.to_ptn::<Board5>()).ok())
+                    .first()
+                    .and_then(|mv| Move::from_string(&mv.to_ptn::<Board5>()).ok())
                 {
-                    refutations.push([mv.clone(), response]);
+                    refutations.push([*mv, response]);
                     longest_refutation_length = longest_refutation_length
                         .max(tinue_search.principal_variation().len() as u32)
                 }
@@ -905,7 +914,66 @@ fn topaz_tinue_avoidance<const S: usize>(
         TopazAvoidanceResult::Aborted
     } else if let Some(mv) = defense {
         TopazAvoidanceResult::Defense(TinueAvoidance {
-            defense: mv,
+            defense: *mv,
+            longest_refutation_length,
+        })
+    } else {
+        TopazAvoidanceResult::NoDefense
+    }
+}
+
+fn topaz_tinue_avoidance_6s<const S: usize>(
+    position: &mut Position<S>,
+    shallow_tiltak_analysis: &TiltakResult<S>,
+) -> TopazAvoidanceResult<S> {
+    let mut legal_moves = vec![];
+    position.generate_moves(&mut legal_moves);
+    // Check Tiltak's suggested moves first, to save time
+    let index_first = legal_moves
+        .iter()
+        .position(|mv| *mv == shallow_tiltak_analysis.pv_first[0])
+        .unwrap();
+    let index_second = legal_moves
+        .iter()
+        .position(|mv| *mv == shallow_tiltak_analysis.pv_second[0])
+        .unwrap();
+    legal_moves.swap(0, index_first);
+    legal_moves.swap(1, index_second);
+
+    let mut has_aborted = false;
+    let mut defense = None;
+    let mut refutations = vec![];
+    let mut longest_refutation_length = 0;
+
+    for mv in legal_moves.iter() {
+        let reverse_move = position.do_move(*mv);
+        let board: Board6 = topaz_tak::board::Board6::try_from_tps(&position.to_fen()).unwrap();
+        position.reverse_move(reverse_move);
+        let mut tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
+            .quiet()
+            .limit(TOPAZ_AVOIDANCE_NODES);
+        match tinue_search.is_tinue() {
+            None => has_aborted = true, // If search aborts in one child, we can still conclude `MultipleDefenses` if two other children are not tinue
+            Some(false) if defense.is_some() => return TopazAvoidanceResult::MultipleDefenses,
+            Some(false) => defense = Some(mv),
+            Some(true) => {
+                if let Some(response) = tinue_search
+                    .principal_variation()
+                    .first()
+                    .and_then(|mv| Move::from_string(&mv.to_ptn::<Board6>()).ok())
+                {
+                    refutations.push([*mv, response]);
+                    longest_refutation_length = longest_refutation_length
+                        .max(tinue_search.principal_variation().len() as u32)
+                }
+            }
+        }
+    }
+    if has_aborted {
+        TopazAvoidanceResult::Aborted
+    } else if let Some(mv) = defense {
+        TopazAvoidanceResult::Defense(TinueAvoidance {
+            defense: *mv,
             longest_refutation_length,
         })
     } else {
@@ -920,7 +988,7 @@ struct PlaytakGame {
     size: usize,
     player_white: String,
     player_black: String,
-    moves: Vec<Move>,
+    notation: String,
     result_string: String,
     game_time: Duration,
     increment: Duration,
@@ -976,7 +1044,11 @@ impl PlaytakGame {
     }
 
     pub fn game_is_legal(&self) -> bool {
-        fn game_is_legal_sized<const S: usize>(moves: &[Move], komi: Komi) -> bool {
+        fn game_is_legal_sized<const S: usize>(notation: &str, komi: Komi) -> bool {
+            let moves: Vec<Move<S>> = notation
+                .split_whitespace()
+                .map(|mv| Move::from_string(mv).expect(mv))
+                .collect();
             let mut position: Position<S> = Position::start_position_with_komi(komi);
             let mut legal_moves = vec![];
             for mv in moves {
@@ -984,21 +1056,21 @@ impl PlaytakGame {
                     return false;
                 }
                 position.generate_moves(&mut legal_moves);
-                if !legal_moves.contains(mv) {
+                if !legal_moves.contains(&mv) {
                     return false;
                 }
                 legal_moves.clear();
-                position.do_move(mv.clone());
+                position.do_move(mv);
             }
             true
         }
         match self.size {
-            3 => game_is_legal_sized::<3>(&self.moves, self.komi),
-            4 => game_is_legal_sized::<4>(&self.moves, self.komi),
-            5 => game_is_legal_sized::<5>(&self.moves, self.komi),
-            6 => game_is_legal_sized::<6>(&self.moves, self.komi),
-            7 => game_is_legal_sized::<7>(&self.moves, self.komi),
-            8 => game_is_legal_sized::<8>(&self.moves, self.komi),
+            3 => game_is_legal_sized::<3>(&self.notation, self.komi),
+            4 => game_is_legal_sized::<4>(&self.notation, self.komi),
+            5 => game_is_legal_sized::<5>(&self.notation, self.komi),
+            6 => game_is_legal_sized::<6>(&self.notation, self.komi),
+            7 => game_is_legal_sized::<7>(&self.notation, self.komi),
+            8 => game_is_legal_sized::<8>(&self.notation, self.komi),
             _ => unreachable!(),
         }
     }
@@ -1007,7 +1079,7 @@ impl PlaytakGame {
 impl TryFrom<GameRow> for PlaytakGame {
     type Error = ();
     fn try_from(row: GameRow) -> Result<Self, ()> {
-        let moves = match row.size {
+        let notation = match row.size {
             3 => parse_notation::<3>(&row.notation),
             4 => parse_notation::<4>(&row.notation),
             5 => parse_notation::<5>(&row.notation),
@@ -1019,10 +1091,10 @@ impl TryFrom<GameRow> for PlaytakGame {
         Ok(PlaytakGame {
             id: row.id as u64,
             date_time: row.date,
-            size: row.size.try_into().map_err(|_| ())?,
+            size: row.size as usize,
             player_white: row.player_white,
             player_black: row.player_black,
-            moves,
+            notation,
             result_string: row.result,
             game_time: row.timertime,
             increment: row.timerinc,
@@ -1053,14 +1125,17 @@ impl TryFrom<GameRow> for PlaytakGame {
     }
 }
 
-fn parse_notation<const S: usize>(notation: &str) -> Vec<Move> {
+fn parse_notation<const S: usize>(notation: &str) -> String {
     if notation.is_empty() {
-        vec![]
+        String::new()
     } else {
         notation
             .split(',')
-            .map(Move::from_string_playtak::<S>)
-            .collect()
+            .map(<Move<S>>::from_string_playtak)
+            .fold(String::new(), |mut acc, mv| {
+                write!(acc, " {}", mv).unwrap();
+                acc
+            })
     }
 }
 
