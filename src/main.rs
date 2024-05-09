@@ -27,7 +27,7 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 fn main() {
-    main_sized::<6>()
+    main_sized::<5>()
 }
 
 fn main_sized<const S: usize>() {
@@ -414,7 +414,7 @@ fn generate_possible_puzzle<'a, const S: usize>(
             return None;
         }
         // Tinue is only possible after white has played S - 2 moves
-        if position.half_moves_played() <= (S - 2) * 2 {
+        if position.half_moves_played() < (S - 2) * 2 {
             return None;
         }
 
