@@ -30,19 +30,15 @@ fn main() {
     main_sized::<5>()
 }
 
-fn main_sized<const S: usize>() {
-    // Create a connection pool
-    //  for MySQL, use MySqlPoolOptions::new()
-    //  for SQLite, use SqlitePoolOptions::new()
-    //  etc.
-    let mut db_conn = Connection::open("games_anon.db").unwrap();
-
-    let games = read_non_bot_games(&mut db_conn).unwrap();
+/// Creates a games table in the puzzles database, and copies all relevant games form the playtak database
+/// The database are separate, so that it's easy to download a new copy of the Playtak db in the future
+fn import_playtak_db(playtak_db: &mut Connection, puzzles_db: &mut Connection, size: usize) {
+    let games = read_non_bot_games(playtak_db).unwrap();
 
     let mut relevant_games: Vec<PlaytakGame> = games
         .into_iter()
         .filter(|game| {
-            game.size == S
+            game.size == size
                 && game.notation.split_whitespace().count() > 4
                 && !game.is_bot_game()
                 && game.game_is_legal()
@@ -52,13 +48,7 @@ fn main_sized<const S: usize>() {
 
     relevant_games.shuffle(&mut thread_rng());
 
-    let start_time = Instant::now();
-    let stats = Arc::new(Stats::default());
-    let games_processed = Arc::new(AtomicU64::new(0));
-
-    let puzzles_pool = Connection::open("puzzles.db").unwrap();
-
-    puzzles_pool
+    puzzles_db
         .execute(
             "CREATE TABLE IF NOT EXISTS games(
             id INT PRIMARY KEY,
@@ -81,7 +71,7 @@ fn main_sized<const S: usize>() {
         )
         .unwrap();
 
-    let mut stmt = puzzles_pool.prepare("INSERT OR IGNORE INTO games (
+    let mut stmt = puzzles_db.prepare("INSERT OR IGNORE INTO games (
             id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi, has_been_analyzed)
             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)").unwrap();
 
@@ -108,6 +98,17 @@ fn main_sized<const S: usize>() {
         ])
         .unwrap();
     }
+}
+
+fn main_sized<const S: usize>() {
+    let start_time = Instant::now();
+    let stats = Arc::new(Stats::default());
+    let games_processed = Arc::new(AtomicU64::new(0));
+
+    let mut db_conn = Connection::open("games_anon.db").unwrap();
+    let mut puzzles_pool = Connection::open("puzzles.db").unwrap();
+
+    import_playtak_db(&mut db_conn, &mut puzzles_pool, S);
 
     puzzles_pool
         .execute(
@@ -154,7 +155,7 @@ fn main_sized<const S: usize>() {
         )
         .unwrap();
 
-    relevant_games = read_processed_games::<S>(&puzzles_pool);
+    let relevant_games = read_processed_games::<S>(&puzzles_pool);
 
     relevant_games.par_iter().for_each_init(
         || Connection::open("puzzles.db").unwrap(),
