@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,7 +27,176 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 fn main() {
-    main_sized::<5>()
+    // main_sized::<5>()
+    find_followups::<6>();
+}
+
+fn find_followups<const S: usize>() {
+    #[derive(Debug)]
+    struct PuzzleRoot<const S: usize> {
+        tps: String,
+        solution: Move<S>,
+        tinue_length: usize,
+    }
+
+    impl<const S: usize> fmt::Display for PuzzleRoot<S> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "tps {}, solution {}, length {}",
+                self.tps,
+                self.solution.to_string(),
+                self.tinue_length
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct PuzzleFollowup<const S: usize> {
+        parent_tps: String,
+        parent_move: Move<S>,
+        solution: Move<S>,
+        tinue_length: usize,
+        longest_parent_tinue_length: usize,
+        tiltak_0komi_eval: f32,
+        tiltak_0komi_second_move_eval: f32,
+        tiltak_0komi_pv_length: u32,
+        tiltak_0komi_second_pv_length: u32,
+        tiltak_0komi_move: Move<S>,
+        tiltak_2komi_eval: f32,
+        tiltak_2komi_second_move_eval: f32,
+        tiltak_2komi_pv_length: u32,
+        tiltak_2komi_second_pv_length: u32,
+        tiltak_2komi_move: Move<S>,
+    }
+
+    let stats = Arc::new(Stats::default());
+
+    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+    let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length FROM puzzles JOIN games ON puzzles.game_id = games.id
+        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND tiltak_0komi_second_move_eval < 0.7")
+    .unwrap();
+    let puzzle_roots: Vec<PuzzleRoot<S>> = stmt
+        .query([S])
+        .unwrap()
+        .mapped(|row| {
+            Ok(PuzzleRoot {
+                tps: row.get(0).unwrap(),
+                solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
+                tinue_length: row.get(2).unwrap(),
+            })
+        })
+        .map(|row| row.unwrap())
+        .collect();
+    println!(
+        "Found {} puzzles roots, like {}",
+        puzzle_roots.len(),
+        puzzle_roots
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    );
+    for puzzle_root in puzzle_roots {
+        println!("Processing puzzle {}", puzzle_root);
+        let mut position: Position<S> =
+            Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
+        assert!(position.move_is_legal(puzzle_root.solution));
+        position.do_move(puzzle_root.solution);
+
+        let parent_tps = position.to_fen();
+
+        let mut legal_moves = vec![];
+        position.generate_moves(&mut legal_moves);
+
+        let mut longest_tinue_length = 0;
+
+        let mut followups: Vec<PuzzleFollowup<S>> = legal_moves
+            .iter()
+            .filter_map(|mv| {
+                let reverse_move = position.do_move(*mv);
+                if position.game_result().is_some() {
+                    position.reverse_move(reverse_move);
+                    return None;
+                }
+                let topaz_result = topaz_search::<S>(&position.to_fen(), &stats);
+                let result = if let TopazResult::Tinue(tinue) = topaz_result {
+                    longest_tinue_length = longest_tinue_length.max(tinue.len());
+
+                    let tiltak_start_time = Instant::now();
+                    let tiltak_0komi_analysis_deep =
+                        tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+
+                    let mut komi_position = position.clone();
+                    komi_position.set_komi(Komi::from_half_komi(4).unwrap());
+
+                    let tiltak_2komi_analysis_deep =
+                        tiltak_search(komi_position.clone(), TILTAK_DEEP_NODES);
+
+                    stats
+                        .tiltak_non_tinue_long
+                        .record(tiltak_start_time.elapsed());
+
+                    Some(PuzzleFollowup {
+                        parent_tps: parent_tps.clone(),
+                        parent_move: *mv,
+                        solution: *tinue.first().unwrap(),
+                        tinue_length: tinue.len(),
+                        longest_parent_tinue_length: 0,
+                        tiltak_0komi_eval: tiltak_0komi_analysis_deep.score_first,
+                        tiltak_0komi_second_move_eval: tiltak_0komi_analysis_deep.score_second,
+                        tiltak_0komi_pv_length: tiltak_0komi_analysis_deep.pv_first.len() as u32,
+                        tiltak_0komi_second_pv_length: tiltak_0komi_analysis_deep.pv_second.len()
+                            as u32,
+                        tiltak_0komi_move: tiltak_0komi_analysis_deep.pv_first[0],
+                        tiltak_2komi_eval: tiltak_2komi_analysis_deep.score_first,
+                        tiltak_2komi_second_move_eval: tiltak_2komi_analysis_deep.score_second,
+                        tiltak_2komi_pv_length: tiltak_2komi_analysis_deep.pv_first.len() as u32,
+                        tiltak_2komi_second_pv_length: tiltak_2komi_analysis_deep.pv_second.len()
+                            as u32,
+                        tiltak_2komi_move: tiltak_2komi_analysis_deep.pv_first[0],
+                    })
+                } else if let TopazResult::NonUniqueTinue(tinue) = topaz_result {
+                    longest_tinue_length = longest_tinue_length.max(tinue.len());
+                    None
+                } else {
+                    None
+                };
+                position.reverse_move(reverse_move);
+                result
+            })
+            .collect();
+
+        for followup in followups.iter_mut() {
+            followup.longest_parent_tinue_length = longest_tinue_length;
+            let score = followup.tinue_length as f32 - followup.longest_parent_tinue_length as f32 // Strongly prioritize the longest tinue defense
+                + if followup.tiltak_0komi_move == followup.solution { // Strong bonus when Tiltak eval isn't conclusively winning, and exceptionally strong if Tiltak also chooses the wrong move
+                    (1.0 - followup.tiltak_0komi_eval) * 10.0 
+                } else { 
+                    (1.0 - followup.tiltak_0komi_eval) * 20.0 
+                }
+                + (1.0 - followup.tiltak_0komi_second_move_eval) * 5.0; // Prefer the second move to have low eval, i.e. the solution is the only strong move in the position
+            
+        }
+
+        println!(
+            "From {} responses, got {} unique tinues, {} others, {} longest tinue length, uniques: {:?}",
+            legal_moves.len(),
+            followups.len(),
+            legal_moves.len() - followups.len(),
+            longest_tinue_length,
+            followups
+                .iter()
+                .map(|followup| format!(
+                    "{}: solution {}, length {}, eval {:.3}, second eval {:.3}",
+                    followup.parent_move.to_string(),
+                    followup.solution.to_string(),
+                    followup.tinue_length,
+                    followup.tiltak_0komi_eval,
+                    followup.tiltak_0komi_second_move_eval,
+                ))
+                .collect::<Vec<_>>(),
+        );
+    }
 }
 
 fn main_sized<const S: usize>() {
