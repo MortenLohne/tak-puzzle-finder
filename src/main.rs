@@ -26,55 +26,183 @@ const TOPAZ_FIRST_MOVE_NODES: usize = 10_000_000;
 const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
+static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
+
 fn main() {
-    // main_sized::<5>()
-    find_followups::<6>();
+    main_sized::<5>()
+    // find_followups::<6>();
+}
+
+#[derive(Debug)]
+struct PuzzleRoot<const S: usize> {
+    tps: String,
+    solution: Move<S>,
+    tinue_length: usize,
+}
+
+impl<const S: usize> fmt::Display for PuzzleRoot<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tps {}, solution {}, length {}",
+            self.tps, self.solution, self.tinue_length
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TinueFollowup<const S: usize> {
+    parent_tps: String,
+    parent_move: Move<S>,
+    solution: Move<S>,
+    tinue_length: usize,
+    longest_parent_tinue_length: usize,
+    tiltak_0komi_eval: f32,
+    tiltak_0komi_second_move_eval: f32,
+    tiltak_0komi_pv_length: u32,
+    tiltak_0komi_second_pv_length: u32,
+    tiltak_0komi_move: Move<S>,
+    tiltak_2komi_eval: f32,
+    tiltak_2komi_second_move_eval: f32,
+    tiltak_2komi_pv_length: u32,
+    tiltak_2komi_second_pv_length: u32,
+    tiltak_2komi_move: Move<S>,
+}
+
+impl<const S: usize> TinueFollowup<S> {
+    fn score_0komi(&self) -> f32 {
+        self.tinue_length as f32 - self.longest_parent_tinue_length as f32 // Strongly prioritize the longest tinue defense
+        + if self.tiltak_0komi_move == self.solution { // Strong bonus when Tiltak eval isn't conclusively winning, and exceptionally strong if Tiltak also chooses the wrong move
+            (1.0 - self.tiltak_0komi_eval) * 6.0
+        } else {
+            (1.0 - self.tiltak_0komi_eval) * 12.0
+        }
+        + (0.9 - self.tiltak_0komi_second_move_eval) * 3.0 // Prefer the second move to have lower eval, i.e. the solution is the only strong move in the position
+    }
+
+    fn score_2komi(&self) -> f32 {
+        self.tinue_length as f32 - self.longest_parent_tinue_length as f32 // Strongly prioritize the longest tinue defense
+        + if self.tiltak_2komi_move == self.solution { // Strong bonus when Tiltak eval isn't conclusively winning, and exceptionally strong if Tiltak also chooses the wrong move
+            (1.0 - self.tiltak_2komi_eval) * 6.0
+        } else {
+            (1.0 - self.tiltak_2komi_eval) * 12.0
+        }
+        + (0.9 - self.tiltak_2komi_second_move_eval) * 3.0 // Prefer the second move to have lower eval, i.e. the solution is the only strong move in the position
+    }
+}
+
+enum PuzzleF<const S: usize> {
+    UniqueTinue(TinueFollowup<S>),
+    NonUniqueTinue,
+    UniqueRoadWin(Move<S>, Move<S>),
+    NonUniqueRoadWin,
+}
+
+fn find_followup<const S: usize>(puzzle_root: &PuzzleRoot<S>, stats: &Stats) -> Vec<PuzzleF<S>> {
+    let mut position: Position<S> =
+        Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
+    assert!(position.move_is_legal(puzzle_root.solution));
+    position.do_move(puzzle_root.solution);
+
+    let parent_tps = position.to_fen();
+
+    let mut legal_moves = vec![];
+    position.generate_moves(&mut legal_moves);
+
+    let mut longest_tinue_length = 0;
+
+    let mut followups: Vec<PuzzleF<S>> = legal_moves
+        .iter()
+        .filter_map(|mv| {
+            let reverse_move = position.do_move(*mv);
+            if position.game_result().is_some() {
+                position.reverse_move(reverse_move);
+                return None;
+            }
+
+            let mut komi_position = position.clone();
+            komi_position.set_komi(Komi::from_half_komi(4).unwrap());
+
+            // Check if this response gives us one or more immediate winning moves
+            let mut immediate_winning_move = None;
+            let mut child_moves = vec![];
+            position.generate_moves(&mut child_moves);
+            for child_move in child_moves {
+                let reverse_child_move = position.do_move(child_move);
+                if position.game_result() == Some(GameResult::win_by(!position.side_to_move())) {
+                    if immediate_winning_move.is_some() {
+                        position.reverse_move(reverse_child_move);
+                        position.reverse_move(reverse_move);
+                        return Some(PuzzleF::NonUniqueRoadWin);
+                    }
+                    immediate_winning_move = Some(child_move);
+                }
+                position.reverse_move(reverse_child_move);
+            }
+
+            if let Some(win) = immediate_winning_move {
+                position.reverse_move(reverse_move);
+                return Some(PuzzleF::UniqueRoadWin(*mv, win));
+            }
+
+            let topaz_result = topaz_search::<S>(&position.to_fen(), stats);
+            let result = if let TopazResult::Tinue(tinue) = topaz_result {
+                longest_tinue_length = longest_tinue_length.max(tinue.len());
+
+                let tiltak_start_time = Instant::now();
+                let tiltak_0komi_analysis_deep = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+
+                let tiltak_2komi_analysis_deep =
+                    tiltak_search(komi_position.clone(), TILTAK_DEEP_NODES);
+
+                stats
+                    .tiltak_non_tinue_long
+                    .record(tiltak_start_time.elapsed());
+
+                Some(PuzzleF::UniqueTinue(TinueFollowup {
+                    parent_tps: parent_tps.clone(),
+                    parent_move: *mv,
+                    solution: *tinue.first().unwrap(),
+                    tinue_length: tinue.len(),
+                    longest_parent_tinue_length: 0,
+                    tiltak_0komi_eval: tiltak_0komi_analysis_deep.score_first,
+                    tiltak_0komi_second_move_eval: tiltak_0komi_analysis_deep.score_second,
+                    tiltak_0komi_pv_length: tiltak_0komi_analysis_deep.pv_first.len() as u32,
+                    tiltak_0komi_second_pv_length: tiltak_0komi_analysis_deep.pv_second.len()
+                        as u32,
+                    tiltak_0komi_move: tiltak_0komi_analysis_deep.pv_first[0],
+                    tiltak_2komi_eval: tiltak_2komi_analysis_deep.score_first,
+                    tiltak_2komi_second_move_eval: tiltak_2komi_analysis_deep.score_second,
+                    tiltak_2komi_pv_length: tiltak_2komi_analysis_deep.pv_first.len() as u32,
+                    tiltak_2komi_second_pv_length: tiltak_2komi_analysis_deep.pv_second.len()
+                        as u32,
+                    tiltak_2komi_move: tiltak_2komi_analysis_deep.pv_first[0],
+                }))
+            } else if let TopazResult::NonUniqueTinue(tinue) = topaz_result {
+                longest_tinue_length = longest_tinue_length.max(tinue.len());
+                Some(PuzzleF::NonUniqueTinue)
+            } else {
+                None
+            };
+            position.reverse_move(reverse_move);
+            result
+        })
+        .collect();
+
+    for followup in followups.iter_mut() {
+        if let PuzzleF::UniqueTinue(tinue) = followup {
+            tinue.longest_parent_tinue_length = longest_tinue_length;
+        }
+    }
+    followups
 }
 
 fn find_followups<const S: usize>() {
-    #[derive(Debug)]
-    struct PuzzleRoot<const S: usize> {
-        tps: String,
-        solution: Move<S>,
-        tinue_length: usize,
-    }
-
-    impl<const S: usize> fmt::Display for PuzzleRoot<S> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "tps {}, solution {}, length {}",
-                self.tps,
-                self.solution.to_string(),
-                self.tinue_length
-            )
-        }
-    }
-
-    #[derive(Debug)]
-    struct PuzzleFollowup<const S: usize> {
-        parent_tps: String,
-        parent_move: Move<S>,
-        solution: Move<S>,
-        tinue_length: usize,
-        longest_parent_tinue_length: usize,
-        tiltak_0komi_eval: f32,
-        tiltak_0komi_second_move_eval: f32,
-        tiltak_0komi_pv_length: u32,
-        tiltak_0komi_second_pv_length: u32,
-        tiltak_0komi_move: Move<S>,
-        tiltak_2komi_eval: f32,
-        tiltak_2komi_second_move_eval: f32,
-        tiltak_2komi_pv_length: u32,
-        tiltak_2komi_second_pv_length: u32,
-        tiltak_2komi_move: Move<S>,
-    }
-
     let stats = Arc::new(Stats::default());
 
     let puzzles_conn = Connection::open("puzzles.db").unwrap();
     let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length FROM puzzles JOIN games ON puzzles.game_id = games.id
-        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND tiltak_0komi_second_move_eval < 0.7")
+        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7) AND puzzles.followups_analyzed = 0")
     .unwrap();
     let puzzle_roots: Vec<PuzzleRoot<S>> = stmt
         .query([S])
@@ -96,107 +224,177 @@ fn find_followups<const S: usize>() {
             .map(ToString::to_string)
             .unwrap_or_default()
     );
-    for puzzle_root in puzzle_roots {
-        println!("Processing puzzle {}", puzzle_root);
-        let mut position: Position<S> =
-            Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
-        assert!(position.move_is_legal(puzzle_root.solution));
-        position.do_move(puzzle_root.solution);
 
-        let parent_tps = position.to_fen();
+    puzzles_conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS tinue_followups(
+            parent_tps TEXT NOT NULL,
+            parent_move TEXT NOT NULL,
+            solution TEXT NOT NULL,
+            tinue_length INTEGER NOT NULL,
+            longest_parent_tinue_length INTEGER NOT NULL,
 
-        let mut legal_moves = vec![];
-        position.generate_moves(&mut legal_moves);
+            tiltak_0komi_eval REAL NOT NULL,
+            tiltak_2komi_eval REAL NOT NULL,
+            tiltak_0komi_second_move_eval REAL NOT NULL,
+            tiltak_2komi_second_move_eval REAL NOT NULL,
+            tiltak_0komi_move TEXT NOT NULL,
+            tiltak_2komi_move TEXT NOT NULL,
+            tiltak_0komi_pv_length INTEGER NOT NULL,
+            tiltak_2komi_pv_length INTEGER NOT NULL,
+            tiltak_0komi_second_pv_length INTEGER NOT NULL,
+            tiltak_2komi_second_pv_length INTEGER NOT NULL,
 
-        let mut longest_tinue_length = 0;
+            followups_analyzed INT DEFAULT 0,
 
-        let mut followups: Vec<PuzzleFollowup<S>> = legal_moves
-            .iter()
-            .filter_map(|mv| {
-                let reverse_move = position.do_move(*mv);
-                if position.game_result().is_some() {
-                    position.reverse_move(reverse_move);
-                    return None;
-                }
-                let topaz_result = topaz_search::<S>(&position.to_fen(), &stats);
-                let result = if let TopazResult::Tinue(tinue) = topaz_result {
-                    longest_tinue_length = longest_tinue_length.max(tinue.len());
+            PRIMARY KEY (parent_tps, parent_move)
+        )",
+            [],
+        )
+        .unwrap();
 
-                    let tiltak_start_time = Instant::now();
-                    let tiltak_0komi_analysis_deep =
-                        tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+    puzzles_conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS road_win_followups(
+                parent_tps TEXT NOT NULL,
+                parent_move TEXT NOT NULL, 
 
-                    let mut komi_position = position.clone();
-                    komi_position.set_komi(Komi::from_half_komi(4).unwrap());
+                PRIMARY KEY (parent_tps, parent_move)
+            )",
+            [],
+        )
+        .unwrap();
 
-                    let tiltak_2komi_analysis_deep =
-                        tiltak_search(komi_position.clone(), TILTAK_DEEP_NODES);
-
-                    stats
-                        .tiltak_non_tinue_long
-                        .record(tiltak_start_time.elapsed());
-
-                    Some(PuzzleFollowup {
-                        parent_tps: parent_tps.clone(),
-                        parent_move: *mv,
-                        solution: *tinue.first().unwrap(),
-                        tinue_length: tinue.len(),
-                        longest_parent_tinue_length: 0,
-                        tiltak_0komi_eval: tiltak_0komi_analysis_deep.score_first,
-                        tiltak_0komi_second_move_eval: tiltak_0komi_analysis_deep.score_second,
-                        tiltak_0komi_pv_length: tiltak_0komi_analysis_deep.pv_first.len() as u32,
-                        tiltak_0komi_second_pv_length: tiltak_0komi_analysis_deep.pv_second.len()
-                            as u32,
-                        tiltak_0komi_move: tiltak_0komi_analysis_deep.pv_first[0],
-                        tiltak_2komi_eval: tiltak_2komi_analysis_deep.score_first,
-                        tiltak_2komi_second_move_eval: tiltak_2komi_analysis_deep.score_second,
-                        tiltak_2komi_pv_length: tiltak_2komi_analysis_deep.pv_first.len() as u32,
-                        tiltak_2komi_second_pv_length: tiltak_2komi_analysis_deep.pv_second.len()
-                            as u32,
-                        tiltak_2komi_move: tiltak_2komi_analysis_deep.pv_first[0],
-                    })
-                } else if let TopazResult::NonUniqueTinue(tinue) = topaz_result {
-                    longest_tinue_length = longest_tinue_length.max(tinue.len());
-                    None
-                } else {
-                    None
-                };
-                position.reverse_move(reverse_move);
-                result
-            })
-            .collect();
-
-        for followup in followups.iter_mut() {
-            followup.longest_parent_tinue_length = longest_tinue_length;
-            let score = followup.tinue_length as f32 - followup.longest_parent_tinue_length as f32 // Strongly prioritize the longest tinue defense
-                + if followup.tiltak_0komi_move == followup.solution { // Strong bonus when Tiltak eval isn't conclusively winning, and exceptionally strong if Tiltak also chooses the wrong move
-                    (1.0 - followup.tiltak_0komi_eval) * 10.0 
-                } else { 
-                    (1.0 - followup.tiltak_0komi_eval) * 20.0 
-                }
-                + (1.0 - followup.tiltak_0komi_second_move_eval) * 5.0; // Prefer the second move to have low eval, i.e. the solution is the only strong move in the position
-            
-        }
-
-        println!(
-            "From {} responses, got {} unique tinues, {} others, {} longest tinue length, uniques: {:?}",
-            legal_moves.len(),
-            followups.len(),
-            legal_moves.len() - followups.len(),
-            longest_tinue_length,
-            followups
-                .iter()
-                .map(|followup| format!(
-                    "{}: solution {}, length {}, eval {:.3}, second eval {:.3}",
-                    followup.parent_move.to_string(),
-                    followup.solution.to_string(),
-                    followup.tinue_length,
-                    followup.tiltak_0komi_eval,
-                    followup.tiltak_0komi_second_move_eval,
-                ))
-                .collect::<Vec<_>>(),
-        );
+    fn store_tinue_followup<const S: usize>(conn: &mut Connection, followup: &TinueFollowup<S>) {
+        conn.execute(
+            "
+        INSERT OR IGNORE INTO tinue_followups (
+            parent_tps,
+            parent_move,
+            solution,
+            tinue_length,
+            longest_parent_tinue_length,
+            tiltak_0komi_eval,
+            tiltak_2komi_eval,
+            tiltak_0komi_second_move_eval,
+            tiltak_2komi_second_move_eval,
+            tiltak_0komi_move,
+            tiltak_2komi_move,
+            tiltak_0komi_pv_length,
+            tiltak_2komi_pv_length,
+            tiltak_0komi_second_pv_length,
+            tiltak_2komi_second_pv_length,
+            followups_analyzed)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
+            rusqlite::params![
+                followup.parent_tps,
+                followup.parent_move.to_string(),
+                followup.solution.to_string(),
+                followup.tinue_length,
+                followup.longest_parent_tinue_length,
+                followup.tiltak_0komi_eval,
+                followup.tiltak_2komi_eval,
+                followup.tiltak_0komi_second_move_eval,
+                followup.tiltak_2komi_second_move_eval,
+                followup.tiltak_0komi_move.to_string(),
+                followup.tiltak_2komi_move.to_string(),
+                followup.tiltak_0komi_pv_length,
+                followup.tiltak_2komi_pv_length,
+                followup.tiltak_0komi_second_pv_length,
+                followup.tiltak_2komi_second_pv_length,
+            ],
+        )
+        .unwrap();
     }
+
+    fn store_road_win_followup(conn: &mut Connection, parent_tps: &str, parent_move_string: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO road_win_followups (parent_tps, parent_move) values (?1, ?2)",
+            rusqlite::params![parent_tps, parent_move_string],
+        )
+        .unwrap();
+    }
+
+    puzzle_roots.par_iter().for_each_init(
+        || Connection::open("puzzles.db").unwrap(),
+        |conn, puzzle_root| {
+            let followups = find_followup(puzzle_root, &stats);
+
+            let mut tinue_followups: Vec<TinueFollowup<S>> = followups
+                .iter()
+                .filter_map(|followup| match followup {
+                    PuzzleF::UniqueTinue(followup_tinue) => Some(followup_tinue.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            tinue_followups.sort_by(|followup1, followup2| {
+                followup1
+                    .score_0komi()
+                    .partial_cmp(&followup2.score_0komi())
+                    .unwrap()
+                    .reverse()
+            });
+
+            let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel);
+            let num_unique_tinues = tinue_followups.len();
+            let num_non_unique_tinues = followups
+                .iter()
+                .filter(|f| matches!(f, PuzzleF::NonUniqueTinue))
+                .count();
+            let num_unique_road_wins = followups
+                .iter()
+                .filter(|f| matches!(f, PuzzleF::UniqueRoadWin(_, _)))
+                .count();
+
+            println!("{} puzzles processed, results for {}:", n, puzzle_root);
+            println!(
+                "Got {} unique tinues, {} num_non_unique_tinues, {:?} longest tinue length",
+                num_unique_tinues,
+                num_non_unique_tinues,
+                tinue_followups
+                    .first()
+                    .map(|tinue| tinue.longest_parent_tinue_length),
+            );
+
+            if !tinue_followups.is_empty() {
+                println!("Followups with unique tinue: ");
+                for followup in tinue_followups.iter() {
+                    println!(
+                        "{}: solution {}, score {:.3}, length {}, eval {:.3}, second eval {:.3}",
+                        followup.parent_move,
+                        followup.solution,
+                        followup.score_0komi(),
+                        followup.tinue_length,
+                        followup.tiltak_0komi_eval,
+                        followup.tiltak_0komi_second_move_eval
+                    );
+                    if followup.score_0komi() > 0.0 || followup.score_2komi() > 0.0 {
+                        store_tinue_followup(conn, followup);
+                    }
+                }
+            } else if num_non_unique_tinues > 0 {
+                println!(
+                    "Got no unique tinues, {} non-unique tinues",
+                    num_non_unique_tinues
+                );
+            } else {
+                println!(
+                    "Got 0 non unique tinues, {} followups with unique road wins",
+                    num_unique_road_wins,
+                );
+                // If all defenses allow us to make a road immediately, choose Tiltak's top defense move, since they're usually sensible
+                let mut position: Position<S> =
+                    Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
+                position.do_move(puzzle_root.solution);
+                let result = tiltak_search(position.clone(), TILTAK_SHALLOW_NODES);
+                store_road_win_followup(conn, &position.to_fen(), &result.pv_first[0].to_string());
+            }
+            println!();
+
+            set_followup_analyzed(conn, &puzzle_root.tps);
+        },
+    );
 }
 
 /// Creates a games table in the puzzles database, and copies all relevant games form the playtak database
@@ -269,6 +467,7 @@ fn import_playtak_db(playtak_db: &mut Connection, puzzles_db: &mut Connection, s
     }
 }
 
+#[allow(unused)]
 fn main_sized<const S: usize>() {
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
@@ -295,6 +494,7 @@ fn main_sized<const S: usize>() {
             tiltak_2komi_pv_length INTEGER NOT NULL,
             tiltak_0komi_second_pv_length INTEGER NOT NULL,
             tiltak_2komi_second_pv_length INTEGER NOT NULL,
+            followups_analyzed INT DEFAULT 0,
             FOREIGN KEY(game_id) REFERENCES games(id)
             )",
             [],
@@ -399,6 +599,19 @@ fn main_sized<const S: usize>() {
     );
 
     println!("Analysis complete");
+}
+
+fn set_followup_analyzed(conn: &mut Connection, tps: &str) {
+    while let Err(err) = conn.execute(
+        "UPDATE puzzles SET followups_analyzed = 1 WHERE tps = ?1",
+        [tps],
+    ) {
+        println!(
+            "Failed to update puzzle \"{}\" into DB. Retrying in 1s: {}",
+            tps, err
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn set_game_analyzed(conn: &mut Connection, game_id: u64) {
