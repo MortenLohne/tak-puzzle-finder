@@ -1072,27 +1072,27 @@ impl<const S: usize> TiltakResult<S> {
 
 fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakResult<S> {
     let settings1 = search::MctsSetting::default().arena_size_for_nodes(nodes);
-    let mut tree1 = search::MonteCarloTree::with_settings(position.clone(), settings1);
+    let mut tree1 = search::MonteCarloTree::new(position.clone(), settings1);
     for _ in 0..nodes {
         match tree1.select() {
-            Some(_) => (),
-            None => {
-                eprintln!("Tiltak search aborted early due to oom");
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("Tiltak search aborted early: {}", err);
                 break;
             }
         }
     }
-    let (best_move, score) = tree1.best_move();
+    let (best_move, score) = tree1.best_move().unwrap();
 
     let settings2 = search::MctsSetting::default()
         .arena_size_for_nodes(nodes)
         .exclude_moves(vec![best_move]);
-    let mut tree2 = search::MonteCarloTree::with_settings(position, settings2);
+    let mut tree2 = search::MonteCarloTree::new(position, settings2);
     for _ in 0..nodes {
         match tree2.select() {
-            Some(_) => (),
-            None => {
-                eprintln!("Tiltak search aborted early due to oom");
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("Tiltak search aborted early: {}", err);
                 break;
             }
         }
@@ -1100,9 +1100,9 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
 
     // It's possible that the second move actually scores better than the first move
     // In that case, swap the moves, to make later processing easier
-    if tree2.best_move().1 > score {
+    if tree2.best_move().unwrap().1 > score {
         TiltakResult {
-            score_first: tree2.best_move().1,
+            score_first: tree2.best_move().unwrap().1,
             pv_first: tree2.pv().collect(),
             score_second: score,
             pv_second: tree1.pv().collect(),
@@ -1111,7 +1111,7 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
         TiltakResult {
             score_first: score,
             pv_first: tree1.pv().collect(),
-            score_second: tree2.best_move().1,
+            score_second: tree2.best_move().unwrap().1,
             pv_second: tree2.pv().collect(),
         }
     }
