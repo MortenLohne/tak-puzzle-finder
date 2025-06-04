@@ -411,6 +411,7 @@ dependencies = [
  "rand 0.9.1",
  "rayon",
  "rusqlite",
+ "serde",
  "serde_rusqlite",
  "tiltak",
  "topaz-tak",

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Write};
 use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -15,6 +15,8 @@ use board_game_traits::{Color, GameResult, Position as PositionTrait};
 use chrono::{DateTime, Utc};
 use pgn_traits::PgnPosition;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_rusqlite::{to_params, to_params_named};
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -644,40 +646,10 @@ fn store_topaz_missed_tinues(conn: &mut Connection, game_id: u32, tps: &str) {
 }
 
 fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
-    let Puzzle {
-        game_id,
-        tps,
-        solution,
-        tiltak_0komi_eval,
-        tiltak_2komi_eval,
-        tiltak_0komi_second_move_eval,
-        tiltak_2komi_second_move_eval,
-        tiltak_0komi_pv_length,
-        tiltak_2komi_pv_length,
-        tiltak_0komi_second_pv_length,
-        tiltak_2komi_second_pv_length,
-        tinue_length,
-        tinue_avoidance_length,
-    } = puzzle;
-
-    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles (game_id, tps, solution, tiltak_0komi_eval, tiltak_2komi_eval, tiltak_0komi_second_move_eval, tiltak_2komi_second_move_eval, tinue_length, tinue_avoidance_length, tiltak_0komi_pv_length, tiltak_2komi_pv_length, tiltak_0komi_second_pv_length, tiltak_2komi_second_pv_length) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)", rusqlite::params![
-        game_id as u32,
-        tps.clone(),
-        solution.clone(),
-        tiltak_0komi_eval,
-        tiltak_2komi_eval,
-        tiltak_0komi_second_move_eval,
-        tiltak_2komi_second_move_eval,
-        tinue_length,
-        tinue_avoidance_length,
-        tiltak_0komi_pv_length,
-        tiltak_2komi_pv_length,
-        tiltak_0komi_second_pv_length,
-        tiltak_2komi_second_pv_length,
-    ]) {
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles VALUES (:game_id, :tps, :solution, :tiltak_0komi_eval, :tiltak_2komi_eval, :tiltak_0komi_second_move_eval, :tiltak_2komi_second_move_eval, :tinue_length, :tinue_avoidance_length, :tiltak_0komi_pv_length, :tiltak_2komi_pv_length, :tiltak_0komi_second_pv_length, :tiltak_2komi_second_pv_length, 0)", to_params_named(&puzzle).unwrap().to_slice().as_slice()) {
         println!(
             "Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}",
-            tps, game_id, err
+            puzzle.tps, puzzle.game_id, err
         );
         thread::sleep(Duration::from_secs(1));
     }
@@ -928,7 +900,7 @@ CREATE TABLE "puzzles" (
 );
 */
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Puzzle {
     game_id: u64,
     tps: String,
@@ -1025,14 +997,27 @@ impl TimeTracker {
     fn print_full(&self) {
         let times: Vec<Duration> = self.times.lock().unwrap().iter().cloned().collect();
         let total_time = self.total_time.lock().unwrap();
-        println!("{} events in {}s total time, average {:.2}s, longest {:.2}s, top 50% {:.2}s, top 1% {:.2}s, top 0.1% {:.2}s", 
+        println!(
+            "{} events in {}s total time, average {:.2}s, longest {:.2}s, top 50% {:.2}s, top 1% {:.2}s, top 0.1% {:.2}s",
             times.len(),
             total_time.as_secs(),
             total_time.as_secs_f32() / times.len() as f32,
             times.last().cloned().unwrap_or_default().as_secs_f32(),
-            times.get(times.len() / 2).cloned().unwrap_or_default().as_secs_f32(),
-            times.get(990 * times.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
-            times.get(999 * times.len() / 1000).cloned().unwrap_or_default().as_secs_f32(),
+            times
+                .get(times.len() / 2)
+                .cloned()
+                .unwrap_or_default()
+                .as_secs_f32(),
+            times
+                .get(990 * times.len() / 1000)
+                .cloned()
+                .unwrap_or_default()
+                .as_secs_f32(),
+            times
+                .get(999 * times.len() / 1000)
+                .cloned()
+                .unwrap_or_default()
+                .as_secs_f32(),
         );
     }
 
