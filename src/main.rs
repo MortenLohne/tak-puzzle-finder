@@ -8,7 +8,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use rayon::prelude::*;
 
 use board_game_traits::{Color, GameResult, Position as PositionTrait};
@@ -16,7 +15,7 @@ use chrono::{DateTime, Utc};
 use pgn_traits::PgnPosition;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_rusqlite::{to_params, to_params_named};
+use serde_rusqlite::to_params_named;
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -415,7 +414,7 @@ fn import_playtak_db(playtak_db: &mut Connection, puzzles_db: &mut Connection, s
         })
         .collect();
 
-    relevant_games.shuffle(&mut thread_rng());
+    relevant_games.shuffle(&mut rand::rng());
 
     puzzles_db
         .execute(
