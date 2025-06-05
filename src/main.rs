@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 
@@ -35,17 +35,34 @@ static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 struct CliArgs {
     #[arg(short, long)]
     size: usize,
-    // Path to the Playtak database file, to import games into the puzzles database. If not provided, only previously imported games will be analyzed.
+    #[command(subcommand)]
+    command: CliCommands,
+}
+
+#[derive(Subcommand)]
+enum CliCommands {
+    /// Find puzzles among positions imported from the Playtak database
+    FindRootPuzzles(FindRootPuzzlesArgs),
+    /// Find followups for puzzles that have already been identified
+    FindFollowups,
+}
+
+#[derive(Args)]
+struct FindRootPuzzlesArgs {
+    /// Path to the Playtak database file, to import games into the puzzles database. If not provided, only previously imported games will be analyzed.
     #[arg(short, long)]
     playtak_db_path: Option<String>,
 }
 
 fn main() {
     let cli_args = CliArgs::parse();
-    match cli_args.size {
-        5 => main_sized::<5>(&cli_args.playtak_db_path),
-        6 => main_sized::<6>(&cli_args.playtak_db_path),
-        _ => panic!("Unsupported size: {}", cli_args.size),
+    match (cli_args.command, cli_args.size) {
+        (CliCommands::FindRootPuzzles(args), 5) => main_sized::<5>(&args.playtak_db_path),
+        (CliCommands::FindRootPuzzles(args), 6) => main_sized::<6>(&args.playtak_db_path),
+        (CliCommands::FindRootPuzzles(_), s) => panic!("Unsupported size: {}", s),
+        (CliCommands::FindFollowups, 5) => find_followups::<5>(),
+        (CliCommands::FindFollowups, 6) => find_followups::<6>(),
+        (CliCommands::FindFollowups, s) => panic!("Unsupported size: {}", s),
     }
 }
 
@@ -331,6 +348,9 @@ fn find_followups<const S: usize>() {
         .unwrap();
     }
 
+    let start_time = Instant::now();
+    let num_root_puzzles = puzzle_roots.len();
+
     puzzle_roots.par_iter().for_each_init(
         || Connection::open("puzzles.db").unwrap(),
         |conn, puzzle_root| {
@@ -363,7 +383,15 @@ fn find_followups<const S: usize>() {
                 .filter(|f| matches!(f, PuzzleF::UniqueRoadWin(_, _)))
                 .count();
 
-            println!("{} puzzles processed, results for {}:", n, puzzle_root);
+            println!(
+                "{}/{} puzzles processed in {:.1}s, ETA {:.1}s, results for {}:",
+                n,
+                num_root_puzzles,
+                start_time.elapsed().as_secs_f32(),
+                (start_time.elapsed().as_secs_f32() / n as f32)
+                    * (num_root_puzzles as f32 - n as f32),
+                puzzle_root
+            );
             println!(
                 "Got {} unique tinues, {} num_non_unique_tinues, {:?} longest tinue length",
                 num_unique_tinues,
