@@ -19,3 +19,4 @@ rusqlite = { version = "0.36.0", features = ["bundled", "chrono"] }
 serde_rusqlite = "0.39.0"
 rayon = "1.7.0"
 serde = { version = "1.0.219", features = ["derive"] }
+clap = { version = "4.5.39", features = ["derive"] }

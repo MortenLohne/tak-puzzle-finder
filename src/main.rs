@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use clap::Parser;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 
@@ -29,9 +30,23 @@ const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct CliArgs {
+    #[arg(short, long)]
+    size: usize,
+    // Path to the Playtak database file, to import games into the puzzles database. If not provided, only previously imported games will be analyzed.
+    #[arg(short, long)]
+    playtak_db_path: Option<String>,
+}
+
 fn main() {
-    main_sized::<5>()
-    // find_followups::<6>();
+    let cli_args = CliArgs::parse();
+    match cli_args.size {
+        5 => main_sized::<5>(&cli_args.playtak_db_path),
+        6 => main_sized::<6>(&cli_args.playtak_db_path),
+        _ => panic!("Unsupported size: {}", cli_args.size),
+    }
 }
 
 #[derive(Debug)]
@@ -469,15 +484,19 @@ fn import_playtak_db(playtak_db: &mut Connection, puzzles_db: &mut Connection, s
 }
 
 #[allow(unused)]
-fn main_sized<const S: usize>() {
+fn main_sized<const S: usize>(playtak_db_name: &Option<String>) {
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
     let games_processed = Arc::new(AtomicU64::new(0));
 
-    let mut db_conn = Connection::open("games_anon.db").unwrap();
     let mut puzzles_pool = Connection::open("puzzles.db").unwrap();
 
-    import_playtak_db(&mut db_conn, &mut puzzles_pool, S);
+    if let Some(playtak_db_name) = playtak_db_name {
+        let mut db_conn = Connection::open(playtak_db_name).unwrap();
+        import_playtak_db(&mut db_conn, &mut puzzles_pool, S);
+    } else {
+        println!("No Playtak database provided, only previously imported games will be analyzed.");
+    }
 
     puzzles_pool
         .execute(
