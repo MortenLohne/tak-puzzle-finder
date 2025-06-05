@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Write};
-use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::{io, mem};
 
 use clap::{Args, Parser, Subcommand};
 use rand::seq::SliceRandom;
@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use pgn_traits::PgnPosition;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_rusqlite::to_params_named;
+use serde_rusqlite::{from_rows, to_params_named};
 use tiltak::position::{self, Komi, Move, Position};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
@@ -45,6 +45,7 @@ enum CliCommands {
     FindRootPuzzles(FindRootPuzzlesArgs),
     /// Find followups for puzzles that have already been identified
     FindFollowups,
+    FindFullPuzzles,
 }
 
 #[derive(Args)]
@@ -59,10 +60,14 @@ fn main() {
     match (cli_args.command, cli_args.size) {
         (CliCommands::FindRootPuzzles(args), 5) => main_sized::<5>(&args.playtak_db_path),
         (CliCommands::FindRootPuzzles(args), 6) => main_sized::<6>(&args.playtak_db_path),
-        (CliCommands::FindRootPuzzles(_), s) => panic!("Unsupported size: {}", s),
+
         (CliCommands::FindFollowups, 5) => find_followups::<5>(),
         (CliCommands::FindFollowups, 6) => find_followups::<6>(),
-        (CliCommands::FindFollowups, s) => panic!("Unsupported size: {}", s),
+
+        (CliCommands::FindFullPuzzles, 5) => find_full_puzzles::<5>(),
+        (CliCommands::FindFullPuzzles, 6) => find_full_puzzles::<6>(),
+
+        (_, s) => panic!("Unsupported size: {}", s),
     }
 }
 
@@ -83,10 +88,20 @@ impl<const S: usize> fmt::Display for PuzzleRoot<S> {
     }
 }
 
-#[derive(Debug, Clone)]
+fn deseralize_move<'de, D, const S: usize>(deserializer: D) -> Result<Move<S>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    Move::from_string(&s).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TinueFollowup<const S: usize> {
     parent_tps: String,
+    #[serde(deserialize_with = "deseralize_move")]
     parent_move: Move<S>,
+    #[serde(deserialize_with = "deseralize_move")]
     solution: Move<S>,
     tinue_length: usize,
     longest_parent_tinue_length: usize,
@@ -94,11 +109,13 @@ struct TinueFollowup<const S: usize> {
     tiltak_0komi_second_move_eval: f32,
     tiltak_0komi_pv_length: u32,
     tiltak_0komi_second_pv_length: u32,
+    #[serde(deserialize_with = "deseralize_move")]
     tiltak_0komi_move: Move<S>,
     tiltak_2komi_eval: f32,
     tiltak_2komi_second_move_eval: f32,
     tiltak_2komi_pv_length: u32,
     tiltak_2komi_second_pv_length: u32,
+    #[serde(deserialize_with = "deseralize_move")]
     tiltak_2komi_move: Move<S>,
 }
 
@@ -129,6 +146,153 @@ enum PuzzleF<const S: usize> {
     NonUniqueTinue,
     UniqueRoadWin(Move<S>, Move<S>),
     NonUniqueRoadWin,
+}
+
+fn find_full_puzzles<const S: usize>() {
+    let stats = Arc::new(Stats::default());
+
+    let mut puzzles_conn = Connection::open("puzzles.db").unwrap();
+
+    let puzzle_roots: Vec<PuzzleRoot<S>> = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length FROM puzzles JOIN games ON puzzles.game_id = games.id
+        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7)")
+    .unwrap()
+        .query([S])
+        .unwrap()
+        .mapped(|row| {
+            Ok(PuzzleRoot {
+                tps: row.get(0).unwrap(),
+                solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
+                tinue_length: row.get(2).unwrap(),
+            })
+        })
+        .map(|row| row.unwrap())
+        .collect();
+    println!("Found {} puzzles roots", puzzle_roots.len());
+    for puzzle_root in puzzle_roots.iter() {
+        let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
+        println!("==========================");
+        println!(
+            "Puzzle TPS: {}, tinue length {}",
+            puzzle_root.tps, puzzle_root.tinue_length
+        );
+        println!("Puzzle solution: {}", puzzle_root.solution);
+
+        let mut moves = vec![puzzle_root.solution];
+
+        position.do_move(puzzle_root.solution);
+
+        find_followup_recursive(&mut puzzles_conn, &mut position, &mut moves);
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+    }
+}
+
+fn find_followup_recursive<const S: usize>(
+    puzzles_conn: &mut Connection,
+    position: &mut Position<S>,
+    moves: &mut Vec<Move<S>>,
+) {
+    let road_win_followup = read_road_win_followup::<S>(puzzles_conn, &position.to_fen());
+    if let Some(road_win_move) = road_win_followup {
+        println!(
+            "Found road win followup for position {}: {}",
+            position.to_fen(),
+            road_win_move
+        );
+
+        let reverse_move = position.do_move(road_win_move);
+        moves.push(road_win_move);
+
+        let mut unique_winning_move: Option<Move<S>> = None;
+        let mut legal_moves = vec![];
+        position.generate_moves(&mut legal_moves);
+        for legal_move in legal_moves {
+            let reverse_move = position.do_move(legal_move);
+            if position.game_result() == Some(GameResult::win_by(!position.side_to_move())) {
+                if unique_winning_move.is_some() {
+                    // Winning move wasn't unique
+                    unique_winning_move = None;
+                    position.reverse_move(reverse_move);
+                    break;
+                }
+                unique_winning_move = Some(legal_move);
+            }
+            position.reverse_move(reverse_move);
+        }
+        if let Some(unique_winning_move) = unique_winning_move {
+            println!("Found unique winning move: {}", unique_winning_move);
+        } else {
+            println!("No unique winning move found, using road win followup");
+        }
+        print!(
+            "{}",
+            moves
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if let Some(unique_winning_move) = unique_winning_move {
+            println!(" {}", unique_winning_move);
+        } else {
+            println!(" *");
+        }
+        position.reverse_move(reverse_move);
+        moves.pop();
+        return;
+    }
+    let followups = read_followup::<S>(puzzles_conn, &position.to_fen());
+    println!(
+        "\nFound {} followups for position {}",
+        followups.len(),
+        position.to_fen()
+    );
+    for followup in followups {
+        println!(
+            "Followup:\n{}\nParent move {}\nSolution {}\ntinue length {}\nlongest parent tinue length {}\n0komi eval {:.3}\n2komi eval {:.3}\n0komi second move eval {:.3}\n2komi second move eval {:.3}\n0komi move {}, 2komi move {}, 0komi pv length {}, 2komi pv length {}, 0komi second pv length {}, 2komi second pv length {}",
+            followup.parent_tps,
+            followup.parent_move,
+            followup.solution,
+            followup.tinue_length,
+            followup.longest_parent_tinue_length,
+            followup.tiltak_0komi_eval,
+            followup.tiltak_2komi_eval,
+            followup.tiltak_0komi_second_move_eval,
+            followup.tiltak_2komi_second_move_eval,
+            followup.tiltak_0komi_move,
+            followup.tiltak_2komi_move,
+            followup.tiltak_0komi_pv_length,
+            followup.tiltak_2komi_pv_length,
+            followup.tiltak_0komi_second_pv_length,
+            followup.tiltak_2komi_second_pv_length
+        );
+        println!();
+        let reverse_move = position.do_move(followup.parent_move);
+        let reverse_move2 = position.do_move(followup.solution);
+        moves.push(followup.parent_move);
+        moves.push(followup.solution);
+
+        find_followup_recursive(puzzles_conn, position, moves);
+
+        moves.pop();
+        moves.pop();
+
+        position.reverse_move(reverse_move2);
+        position.reverse_move(reverse_move);
+    }
+}
+
+fn read_followup<const S: usize>(puzzles_db: &mut Connection, tps: &str) -> Vec<TinueFollowup<S>> {
+    let mut stmt = puzzles_db
+        .prepare("SELECT * FROM tinue_followups WHERE parent_tps = ?1")
+        .unwrap();
+    let result: Vec<TinueFollowup<S>> = from_rows::<TinueFollowup<S>>(stmt.query([tps]).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    result
 }
 
 fn find_followup<const S: usize>(puzzle_root: &PuzzleRoot<S>, stats: &Stats) -> Vec<PuzzleF<S>> {
@@ -228,6 +392,27 @@ fn find_followup<const S: usize>(puzzle_root: &PuzzleRoot<S>, stats: &Stats) -> 
         }
     }
     followups
+}
+
+fn store_road_win_followup(conn: &mut Connection, parent_tps: &str, parent_move_string: &str) {
+    conn.execute(
+        "INSERT OR IGNORE INTO road_win_followups (parent_tps, parent_move) values (?1, ?2)",
+        rusqlite::params![parent_tps, parent_move_string],
+    )
+    .unwrap();
+}
+
+fn read_road_win_followup<const S: usize>(
+    conn: &mut Connection,
+    parent_tps: &str,
+) -> Option<Move<S>> {
+    let mut stmt = conn
+        .prepare("SELECT parent_move FROM road_win_followups WHERE parent_tps = ?1")
+        .unwrap();
+    let result: Option<String> = stmt
+        .query_row([parent_tps], |row| Ok(row.get::<_, String>(0).unwrap()))
+        .ok();
+    result.and_then(|s| Move::from_string(&s).ok())
 }
 
 fn find_followups<const S: usize>() {
@@ -336,14 +521,6 @@ fn find_followups<const S: usize>() {
                 followup.tiltak_0komi_second_pv_length,
                 followup.tiltak_2komi_second_pv_length,
             ],
-        )
-        .unwrap();
-    }
-
-    fn store_road_win_followup(conn: &mut Connection, parent_tps: &str, parent_move_string: &str) {
-        conn.execute(
-            "INSERT OR IGNORE INTO road_win_followups (parent_tps, parent_move) values (?1, ?2)",
-            rusqlite::params![parent_tps, parent_move_string],
         )
         .unwrap();
     }
