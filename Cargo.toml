@@ -20,3 +20,4 @@ serde_rusqlite = "0.39.0"
 rayon = "1.7.0"
 serde = { version = "1.0.219", features = ["derive"] }
 clap = { version = "4.5.39", features = ["derive"] }
+lz-str = "0.2.1"

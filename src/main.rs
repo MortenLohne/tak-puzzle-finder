@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +45,7 @@ enum CliCommands {
     FindRootPuzzles(FindRootPuzzlesArgs),
     /// Find followups for puzzles that have already been identified
     FindFollowups,
+    /// Gather together full tinue puzzles, and go through them manually
     FindFullPuzzles,
 }
 
@@ -73,6 +74,7 @@ fn main() {
 
 #[derive(Debug)]
 struct PuzzleRoot<const S: usize> {
+    playtak_game_id: u32,
     tps: String,
     solution: Move<S>,
     tinue_length: usize,
@@ -148,18 +150,226 @@ enum PuzzleF<const S: usize> {
     NonUniqueRoadWin,
 }
 
-fn find_full_puzzles<const S: usize>() {
-    let stats = Arc::new(Stats::default());
+struct FullTinuePuzzleOption<const S: usize> {
+    playtak_game_id: u32,
+    tps: String,
+    root_tinue_length: usize,
+    solutions: Vec<(Vec<Move<S>>, bool)>,
+}
 
+#[derive(Serialize, Deserialize)]
+struct FullTinuePuzzle {
+    root_tps: String,
+    defender_start_move: String,
+    playtak_game_id: usize,
+    root_tinue_length: usize,
+    solution: String,
+    end_in_road: bool,
+    first_move_rating: Option<usize>,
+    total_rating: Option<usize>,
+}
+
+impl FullTinuePuzzle {
+    fn from_puzzle_option<const S: usize>(
+        puzzle_option: &FullTinuePuzzleOption<S>,
+        playtak_game: &PlaytakGame,
+        solution_index: usize,
+    ) -> Self {
+        let mut position: Position<S> = Position::start_position();
+        let (root_tps, defender_start_move) = playtak_game
+            .notation
+            .split_whitespace()
+            .find_map(|move_string| {
+                let mv = Move::from_string(&move_string).unwrap();
+                let last_tps = position.to_fen();
+                position.do_move(mv);
+                let tps = position.to_fen();
+                if tps == puzzle_option.tps {
+                    Some((last_tps, mv))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        FullTinuePuzzle {
+            root_tps,
+            defender_start_move: defender_start_move.to_string(),
+            playtak_game_id: puzzle_option.playtak_game_id as usize,
+            root_tinue_length: puzzle_option.root_tinue_length,
+            solution: puzzle_option.solutions[solution_index]
+                .0
+                .iter()
+                .map(|mv| mv.to_string())
+                .collect::<Vec<String>>()
+                .join(" "),
+            end_in_road: puzzle_option.solutions[solution_index].1,
+            first_move_rating: None,
+            total_rating: None,
+        }
+    }
+}
+
+impl<const S: usize> FullTinuePuzzleOption<S> {
+    /// Returns a single solution if the puzzle has only one, or if it has exactly one that goes to road
+    fn single_solution(&self) -> Option<(Vec<Move<S>>, bool)> {
+        if self.solutions.len() == 1 {
+            Some(self.solutions[0].clone())
+        } else if self
+            .solutions
+            .iter()
+            .filter(|(_, goes_to_road)| *goes_to_road)
+            .count()
+            == 1
+        {
+            self.solutions
+                .iter()
+                .cloned()
+                .find(|(_, goes_to_road)| *goes_to_road)
+                .clone()
+        } else {
+            None
+        }
+    }
+}
+
+fn insert_full_puzzles<const S: usize>(
+    db_conn: &mut Connection,
+    puzzles: &[FullTinuePuzzleOption<S>],
+) {
+    db_conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS full_tinue_puzzles (
+                root_tps TEXT NOT NULL,
+                defender_start_move TEXT NOT NULL,
+                playtak_game_id INTEGER NOT NULL,
+                root_tinue_length INTEGER NOT NULL,
+                solution TEXT NOT NULL,
+                end_in_road INTEGER NOT NULL,
+                first_move_rating INTEGER,
+                total_rating INTEGER,
+                PRIMARY KEY (root_tps, defender_start_move)
+            )",
+            [],
+        )
+        .unwrap();
+
+    let all_playtak_games = read_all_games::<S>(db_conn);
+    let playtak_games_map = all_playtak_games
+        .iter()
+        .map(|game| (game.id, game.clone()))
+        .collect::<HashMap<u64, PlaytakGame>>();
+
+    let num_puzzles = puzzles.len();
+
+    for (i, puzzle) in puzzles.iter().enumerate() {
+        let playtak_game = &playtak_games_map[&(puzzle.playtak_game_id as u64)];
+        match puzzle.single_solution() {
+            // A single solution that goes to road does not need manual review
+            Some((_, true)) => {
+                println!("Automatically added puzzle");
+                let full_puzzle = FullTinuePuzzle::from_puzzle_option(puzzle, playtak_game, 0);
+
+                let rows_affected = db_conn.execute("INSERT OR IGNORE INTO full_tinue_puzzles VALUES (:root_tps, :defender_start_move, :playtak_game_id, :root_tinue_length, :solution, :end_in_road, :first_move_rating, :total_rating)", to_params_named(&full_puzzle).unwrap().to_slice().as_slice()).unwrap();
+                if rows_affected != 1 {
+                    println!("Warning: {} rows affected by insert", rows_affected);
+                }
+            }
+            _ => {
+                let tinue = puzzle;
+                println!("==========================");
+                println!(
+                    "Puzzle {}/{} TPS: {}, tinue length {}",
+                    i, num_puzzles, tinue.tps, tinue.root_tinue_length
+                );
+                let ptn = format!(
+                    "[Size \"{}\"]
+            [TPS \"{}\"]
+            [Player1 \"{}\"]
+            [Player2 \"{}\"]
+            [Komi \"{}\"]
+                {}
+            ",
+                    S,
+                    tinue.tps,
+                    playtak_game.player_white,
+                    playtak_game.player_black,
+                    playtak_game.komi,
+                    tinue.solutions[0]
+                        .0
+                        .iter()
+                        .map(|mv| mv.to_string())
+                        .collect::<Vec<String>>()
+                        .join(" "),
+                );
+
+                println!(
+                    "Url: https://ptn.ninja/{}&ply=0",
+                    lz_str::compress_to_encoded_uri_component(&ptn)
+                );
+                let mut line_strings = vec![];
+                for (line, goes_to_road) in tinue.solutions.iter() {
+                    let mut line_string = line
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if line.len() % 2 == 0 {
+                        // If the line's length is even, the last move is any move that wins
+                        line_string.push_str(" *");
+                    }
+                    print!("{}", line_string);
+                    line_strings.push(line_string);
+                    if *goes_to_road {
+                        println!(" (goes to road win)");
+                    } else {
+                        println!();
+                    }
+                }
+
+                println!("Copy-paste the solution to add it to the database, type 'skip' to skip");
+                loop {
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).unwrap();
+                    let input = input.trim();
+                    if input == "skip" {
+                        println!("Skipping puzzle");
+                        break;
+                    }
+                    if input.is_empty() {
+                        println!("Empty input, try again");
+                        continue;
+                    }
+                    let solution_index = line_strings.iter().position(|s| s == input);
+                    let Some(solution_index) = solution_index else {
+                        println!("Solution not found in the list, try again");
+                        continue;
+                    };
+
+                    let full_puzzle =
+                        FullTinuePuzzle::from_puzzle_option(puzzle, playtak_game, solution_index);
+
+                    let rows_affected = db_conn.execute("INSERT OR IGNORE INTO full_tinue_puzzles VALUES (:root_tps, :defender_start_move, :playtak_game_id, :root_tinue_length, :solution, :end_in_road, :first_move_rating, :total_rating)", to_params_named(&full_puzzle).unwrap().to_slice().as_slice()).unwrap();
+                    if rows_affected != 1 {
+                        println!("Warning: {} rows affected by insert", rows_affected);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn find_full_puzzles<const S: usize>() {
     let mut puzzles_conn = Connection::open("puzzles.db").unwrap();
 
-    let puzzle_roots: Vec<PuzzleRoot<S>> = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length FROM puzzles JOIN games ON puzzles.game_id = games.id
+    let puzzle_roots: Vec<PuzzleRoot<S>> = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
         WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7)")
     .unwrap()
         .query([S])
         .unwrap()
         .mapped(|row| {
             Ok(PuzzleRoot {
+                playtak_game_id: row.get::<_, u32>(3).unwrap(),
                 tps: row.get(0).unwrap(),
                 solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
                 tinue_length: row.get(2).unwrap(),
@@ -167,42 +377,45 @@ fn find_full_puzzles<const S: usize>() {
         })
         .map(|row| row.unwrap())
         .collect();
+
+    let mut full_tinues: Vec<FullTinuePuzzleOption<S>> = vec![];
+
     println!("Found {} puzzles roots", puzzle_roots.len());
     for puzzle_root in puzzle_roots.iter() {
         let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
-        println!("==========================");
-        println!(
-            "Puzzle TPS: {}, tinue length {}",
-            puzzle_root.tps, puzzle_root.tinue_length
-        );
-        println!("Puzzle solution: {}", puzzle_root.solution);
 
         let mut moves = vec![puzzle_root.solution];
+        let mut possible_lines = vec![];
 
         position.do_move(puzzle_root.solution);
 
-        find_followup_recursive(&mut puzzles_conn, &mut position, &mut moves);
+        find_followup_recursive(
+            &mut puzzles_conn,
+            &mut position,
+            &mut moves,
+            &mut possible_lines,
+        );
 
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
+        let tinue = FullTinuePuzzleOption {
+            playtak_game_id: puzzle_root.playtak_game_id,
+            tps: puzzle_root.tps.clone(),
+            root_tinue_length: puzzle_root.tinue_length,
+            solutions: possible_lines.clone(),
+        };
+        full_tinues.push(tinue);
     }
+
+    insert_full_puzzles(&mut puzzles_conn, &full_tinues);
 }
 
 fn find_followup_recursive<const S: usize>(
     puzzles_conn: &mut Connection,
     position: &mut Position<S>,
     moves: &mut Vec<Move<S>>,
+    possible_lines: &mut Vec<(Vec<Move<S>>, bool)>,
 ) {
     let road_win_followup = read_road_win_followup::<S>(puzzles_conn, &position.to_fen());
     if let Some(road_win_move) = road_win_followup {
-        println!(
-            "Found road win followup for position {}: {}",
-            position.to_fen(),
-            road_win_move
-        );
-
         let reverse_move = position.do_move(road_win_move);
         moves.push(road_win_move);
 
@@ -223,59 +436,30 @@ fn find_followup_recursive<const S: usize>(
             position.reverse_move(reverse_move);
         }
         if let Some(unique_winning_move) = unique_winning_move {
-            println!("Found unique winning move: {}", unique_winning_move);
-        } else {
-            println!("No unique winning move found, using road win followup");
+            moves.push(unique_winning_move);
         }
-        print!(
-            "{}",
-            moves
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        if let Some(unique_winning_move) = unique_winning_move {
-            println!(" {}", unique_winning_move);
-        } else {
-            println!(" *");
+
+        possible_lines.push((moves.clone(), true));
+        if unique_winning_move.is_some() {
+            moves.pop();
         }
         position.reverse_move(reverse_move);
         moves.pop();
         return;
     }
     let followups = read_followup::<S>(puzzles_conn, &position.to_fen());
-    println!(
-        "\nFound {} followups for position {}",
-        followups.len(),
-        position.to_fen()
-    );
+
+    if followups.is_empty() {
+        possible_lines.push((moves.clone(), false));
+        return;
+    }
     for followup in followups {
-        println!(
-            "Followup:\n{}\nParent move {}\nSolution {}\ntinue length {}\nlongest parent tinue length {}\n0komi eval {:.3}\n2komi eval {:.3}\n0komi second move eval {:.3}\n2komi second move eval {:.3}\n0komi move {}, 2komi move {}, 0komi pv length {}, 2komi pv length {}, 0komi second pv length {}, 2komi second pv length {}",
-            followup.parent_tps,
-            followup.parent_move,
-            followup.solution,
-            followup.tinue_length,
-            followup.longest_parent_tinue_length,
-            followup.tiltak_0komi_eval,
-            followup.tiltak_2komi_eval,
-            followup.tiltak_0komi_second_move_eval,
-            followup.tiltak_2komi_second_move_eval,
-            followup.tiltak_0komi_move,
-            followup.tiltak_2komi_move,
-            followup.tiltak_0komi_pv_length,
-            followup.tiltak_2komi_pv_length,
-            followup.tiltak_0komi_second_pv_length,
-            followup.tiltak_2komi_second_pv_length
-        );
-        println!();
         let reverse_move = position.do_move(followup.parent_move);
         let reverse_move2 = position.do_move(followup.solution);
         moves.push(followup.parent_move);
         moves.push(followup.solution);
 
-        find_followup_recursive(puzzles_conn, position, moves);
+        find_followup_recursive(puzzles_conn, position, moves, possible_lines);
 
         moves.pop();
         moves.pop();
@@ -419,7 +603,7 @@ fn find_followups<const S: usize>() {
     let stats = Arc::new(Stats::default());
 
     let puzzles_conn = Connection::open("puzzles.db").unwrap();
-    let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length FROM puzzles JOIN games ON puzzles.game_id = games.id
+    let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
         WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7) AND puzzles.followups_analyzed = 0")
     .unwrap();
     let puzzle_roots: Vec<PuzzleRoot<S>> = stmt
@@ -427,6 +611,7 @@ fn find_followups<const S: usize>() {
         .unwrap()
         .mapped(|row| {
             Ok(PuzzleRoot {
+                playtak_game_id: row.get::<_, u32>(3).unwrap(),
                 tps: row.get(0).unwrap(),
                 solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
                 tinue_length: row.get(2).unwrap(),
@@ -881,6 +1066,63 @@ fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
 fn read_processed_games<const S: usize>(conn: &Connection) -> Vec<PlaytakGame> {
     let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi FROM games
         WHERE has_been_analyzed = 0 AND size = ?1")
+    .unwrap();
+    let rows = stmt.query([S]).unwrap().mapped(|row| {
+        Ok(GameRow {
+            id: row.get(0).unwrap(),
+            date: row.get(1).unwrap(),
+            size: row.get(2).unwrap(),
+            player_white: row.get(3).unwrap(),
+            player_black: row.get(4).unwrap(),
+            notation: row.get(5).unwrap(),
+            result: row.get(6).unwrap(),
+            timertime: Duration::from_secs(row.get(7).unwrap()),
+            timerinc: Duration::from_secs(row.get(8).unwrap()),
+            rating_white: row.get(9).unwrap(),
+            rating_black: row.get(10).unwrap(),
+            unrated: row.get(11).unwrap(),
+            tournament: row.get(12).unwrap(),
+            komi: row.get(13).unwrap(),
+            pieces: position::starting_stones(row.get(2).unwrap()) as i64,
+            capstones: position::starting_capstones(row.get(2).unwrap()) as i64,
+        })
+    });
+
+    rows.map(|row| {
+        let row = row.unwrap();
+        PlaytakGame {
+            id: row.id as u64,
+            date_time: row.date,
+            size: row.size as usize,
+            player_white: row.player_white,
+            player_black: row.player_black,
+            notation: row.notation,
+            result_string: row.result,
+            game_time: row.timertime,
+            increment: row.timerinc,
+            rating_white: if row.rating_white == 0 {
+                None
+            } else {
+                Some(row.rating_white)
+            },
+            rating_black: if row.rating_black == 0 {
+                None
+            } else {
+                Some(row.rating_black)
+            },
+            is_rated: !row.unrated,
+            is_tournament: row.tournament,
+            komi: Komi::from_half_komi(row.komi as i8).unwrap(),
+            flats: row.pieces,
+            caps: row.capstones,
+        }
+    })
+    .collect()
+}
+
+fn read_all_games<const S: usize>(conn: &Connection) -> Vec<PlaytakGame> {
+    let mut stmt = conn.prepare("SELECT id, date, size, player_white, player_black, notation, result, timertime, timerinc, rating_white, rating_black, unrated, tournament, komi FROM games
+        WHERE size = ?1")
     .unwrap();
     let rows = stmt.query([S]).unwrap().mapped(|row| {
         Ok(GameRow {
