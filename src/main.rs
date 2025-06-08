@@ -16,8 +16,8 @@ use chrono::{DateTime, Utc};
 use pgn_traits::PgnPosition;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_rusqlite::{from_rows, to_params_named};
-use tiltak::position::{self, ExpMove, Komi, Move, Position};
+use serde_rusqlite::{from_row, from_rows, to_params_named};
+use tiltak::position::{self, ExpMove, Komi, Move, Position, Role};
 use tiltak::search;
 use topaz_tak::board::{Board5, Board6};
 
@@ -49,6 +49,7 @@ enum CliCommands {
     FindFullPuzzles,
     FindRootGaelets,
     FindFlatWins,
+    ExtendTinuePuzzles,
 }
 
 #[derive(Args)]
@@ -76,7 +77,10 @@ fn main() {
         (CliCommands::FindFlatWins, 5) => find_movement_flat_wins::<5>(),
         (CliCommands::FindFlatWins, 6) => find_movement_flat_wins::<6>(),
 
-        (_, s) => panic!("Unsupported size: {}", s),
+        (CliCommands::ExtendTinuePuzzles, 5) => extend_tinue_puzzles::<5>(),
+        (CliCommands::ExtendTinuePuzzles, 6) => extend_tinue_puzzles::<6>(),
+
+        (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
 }
 
@@ -104,6 +108,156 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     Move::from_string(&s).map_err(serde::de::Error::custom)
+}
+
+/// Checks that the position is a forced win in 2 ply (so a loss for side-to-move),
+/// and returns the most challenging move for the defending side, based on some heuristics.
+/// If the best defending move only allow one winning move for the attacking side, it returns that move as well
+fn find_last_defending_move<const S: usize>(
+    position: &mut Position<S>,
+) -> Option<(Move<S>, Option<Move<S>>)> {
+    let mut defending_moves = vec![];
+    position.generate_moves(&mut defending_moves);
+    let results: Vec<_> = defending_moves
+        .into_iter()
+        .map(|defending_move| {
+            let reverse_move = position.do_move(defending_move);
+
+            let mut moves = vec![];
+            position.generate_moves(&mut moves);
+            let mut num_winning_moves = 0;
+            let mut winning_move = None;
+            for mv in moves {
+                let reverse_move = position.do_move(mv);
+                if position.game_result() == Some(GameResult::win_by(!position.side_to_move())) {
+                    winning_move = Some(mv);
+                    num_winning_moves += 1;
+                }
+                position.reverse_move(reverse_move);
+            }
+
+            position.reverse_move(reverse_move);
+            (defending_move, num_winning_moves, winning_move)
+        })
+        .collect();
+    let (_, lowest_winning_moves, _) = results
+        .iter()
+        .min_by_key(|(_, num_winning_moves, _)| *num_winning_moves)
+        .unwrap()
+        .clone();
+
+    if lowest_winning_moves == 0 {
+        // At least one defending move leads to non win
+        return None;
+    }
+
+    let (best_move, _, winning_response) = results
+        .into_iter()
+        .filter(|(_, num_winning_moves, _)| *num_winning_moves == lowest_winning_moves)
+        .max_by_key(|(mv, _, _)| {
+            let mut score = 0;
+            if matches!(mv.expand(), ExpMove::Place(Role::Wall, _)) {
+                score += 10; // Prefer wall placements
+            }
+            if position
+                .moves()
+                .last()
+                .unwrap()
+                .destination_square()
+                .neighbors()
+                .any(|neighbor| neighbor == mv.destination_square())
+            {
+                score += 2; // Prefer moves that are adjacent to the last attacking move
+            }
+            if position.moves().last().unwrap().origin_square() == mv.destination_square() {
+                score += 1; // Prefer moves behind the last attacking move
+            }
+            score
+        })
+        .unwrap();
+
+    Some((
+        best_move,
+        if lowest_winning_moves == 1 {
+            winning_response
+        } else {
+            None
+        },
+    ))
+}
+
+/// One-off script for extending solutions to 3-ply tinue puzzles, where the solution was erronously only one move long,
+/// but any defending move leads to an immediate win
+fn extend_tinue_puzzles<const S: usize>() {
+    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+
+    let tinue_puzzles: Vec<FullTinuePuzzle> = puzzles_conn
+        .prepare("SELECT * FROM full_tinue_puzzles WHERE end_in_road = 0")
+        .unwrap()
+        .query_and_then([], from_row::<FullTinuePuzzle>)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    let extendable_puzzles: Vec<FullTinuePuzzle> = tinue_puzzles
+        .iter()
+        .filter(|puzzle| {
+            let solution_length = puzzle.solution.split_whitespace().count();
+            puzzle.root_tinue_length == solution_length + 2
+        })
+        .cloned()
+        .collect();
+
+    for puzzle in extendable_puzzles.iter() {
+        let mut position: Position<S> = Position::from_fen(&puzzle.root_tps).unwrap();
+        position.do_move(Move::from_string(&puzzle.defender_start_move).unwrap());
+        let start_tps = position.to_fen();
+        for mv_str in puzzle.solution.split_whitespace() {
+            let mv = Move::from_string(mv_str).unwrap();
+            assert!(position.move_is_legal(mv), "Illegal move: {}", mv);
+            position.do_move(mv);
+        }
+        if position.game_result().is_some() || puzzle.root_tinue_length % 2 == 0 {
+            println!(
+                "Found unexpected winning position in puzzle #{}",
+                puzzle.playtak_game_id
+            );
+            continue; // Skip puzzles that are already solved
+        }
+
+        let last_defending_move = find_last_defending_move(&mut position);
+
+        if let Some((last_move, unique_win)) = last_defending_move {
+            let mut new_solution = format!("{} {}", puzzle.solution, last_move);
+            if let Some(unique_win) = unique_win {
+                write!(new_solution, " {}", unique_win).unwrap();
+            }
+            let rows_affected = puzzles_conn
+            .execute(
+                "UPDATE full_tinue_puzzles SET end_in_road = 1, solution = ?1 WHERE root_tps = ?2 AND defender_start_move = ?3",
+                [&new_solution, &puzzle.root_tps, &puzzle.defender_start_move],
+            )
+            .unwrap();
+            println!(
+                "Updated puzzle, affected {} rows, new solution {}",
+                rows_affected, new_solution
+            );
+        }
+
+        println!(
+            "#{}: TPS {}\nsolution: {}, tinue length {}\nBest defending move: {:?}",
+            puzzle.playtak_game_id,
+            start_tps,
+            puzzle.solution,
+            puzzle.root_tinue_length,
+            last_defending_move.map(|(mv, unique_win)| format!(
+                "{}, unique win: {:?}",
+                mv,
+                unique_win.map(|mv| mv.to_string())
+            ))
+        );
+        println!();
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -440,7 +594,7 @@ struct FullTinuePuzzleOption<const S: usize> {
     solutions: Vec<(Vec<Move<S>>, bool)>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct FullTinuePuzzle {
     root_tps: String,
     defender_start_move: String,
