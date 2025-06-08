@@ -50,6 +50,7 @@ enum CliCommands {
     FindRootGaelets,
     FindFlatWins,
     ExtendTinuePuzzles,
+    ShowPuzzle,
 }
 
 #[derive(Args)]
@@ -80,6 +81,9 @@ fn main() {
         (CliCommands::ExtendTinuePuzzles, 5) => extend_tinue_puzzles::<5>(),
         (CliCommands::ExtendTinuePuzzles, 6) => extend_tinue_puzzles::<6>(),
 
+        (CliCommands::ShowPuzzle, 5) => show_puzzle::<5>(),
+        (CliCommands::ShowPuzzle, 6) => show_puzzle::<6>(),
+
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
 }
@@ -108,6 +112,101 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     Move::from_string(&s).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FinishedPuzzle {
+    size: usize,
+    half_komi: u32,
+    root_tps: String,
+    defender_start_move: String,
+    solution: String,
+    playtak_game_id: usize,
+    player_white: String,
+    player_black: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FrontendPuzzle {
+    size: usize,
+    komi: String,
+    #[serde(rename = "rootTPS")]
+    root_tps: String,
+    defender_start_move: String,
+    solution: Vec<String>,
+    target_time_seconds: u32,
+    player_white: String,
+    player_black: String,
+    playtak_game_id: usize,
+}
+
+impl From<FinishedPuzzle> for FrontendPuzzle {
+    fn from(puzzle: FinishedPuzzle) -> Self {
+        let komi = Komi::from_half_komi(puzzle.half_komi as i8).unwrap();
+        FrontendPuzzle {
+            size: puzzle.size,
+            komi: komi.to_string(),
+            root_tps: puzzle.root_tps,
+            defender_start_move: puzzle.defender_start_move,
+            solution: puzzle
+                .solution
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect(),
+            target_time_seconds: 120, // Default target time for puzzles
+            player_white: puzzle.player_white,
+            player_black: puzzle.player_black,
+            playtak_game_id: puzzle.playtak_game_id,
+        }
+    }
+}
+
+fn read_random_puzzle(puzzles_conn: &Connection, size: usize) -> FinishedPuzzle {
+    puzzles_conn
+        .prepare("SELECT full_tinue_puzzles.*, games.player_white, games.player_black, games.size, games.komi as half_komi FROM full_tinue_puzzles JOIN games on full_tinue_puzzles.playtak_game_id = games.id WHERE games.size = ?1 ORDER BY RANDOM() LIMIT 1")
+        .unwrap()
+        .query_and_then([size], from_row::<FinishedPuzzle>)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()[0].clone()
+}
+
+fn show_puzzle<const S: usize>() {
+    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+
+    let puzzle: FinishedPuzzle = read_random_puzzle(&puzzles_conn, S);
+
+    let frontend_puzzle: FrontendPuzzle = puzzle.clone().into();
+    println!(
+        "Puzzle JSON: {}",
+        serde_json::to_string_pretty(&frontend_puzzle).unwrap()
+    );
+
+    println!(
+        "Puzzle: {}",
+        generate_ptn_ninja_link(
+            S,
+            &puzzle.root_tps,
+            &puzzle.defender_start_move,
+            &puzzle.player_white,
+            &puzzle.player_black,
+            Komi::from_half_komi(puzzle.half_komi as i8).unwrap(),
+        )
+    );
+
+    let moves_with_solution = format!("{} {}", puzzle.defender_start_move, puzzle.solution);
+
+    println!(
+        "Solution: {}",
+        generate_ptn_ninja_link(
+            S,
+            &puzzle.root_tps,
+            &moves_with_solution,
+            "White",
+            "Black",
+            Komi::default(),
+        )
+    );
 }
 
 /// Checks that the position is a forced win in 2 ply (so a loss for side-to-move),
@@ -667,6 +766,31 @@ impl<const S: usize> FullTinuePuzzleOption<S> {
             None
         }
     }
+}
+
+fn generate_ptn_ninja_link(
+    size: usize,
+    root_tps: &str,
+    moves: &str,
+    player_white: &str,
+    player_black: &str,
+    komi: Komi,
+) -> String {
+    let ptn = format!(
+        "[Size \"{}\"]
+            [TPS \"{}\"]
+            [Player1 \"{}\"]
+            [Player2 \"{}\"]
+            [Komi \"{}\"]
+                {}
+            ",
+        size, root_tps, player_white, player_black, komi, moves,
+    );
+
+    format!(
+        "Url: https://ptn.ninja/{}&ply=1",
+        lz_str::compress_to_encoded_uri_component(&ptn)
+    )
 }
 
 fn insert_full_puzzles<const S: usize>(
