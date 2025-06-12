@@ -28,6 +28,8 @@ const TOPAZ_FIRST_MOVE_NODES: usize = 10_000_000;
 const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
+mod export;
+
 static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
@@ -51,6 +53,7 @@ enum CliCommands {
     FindImmediateWins,
     ExtendTinuePuzzles,
     ShowPuzzle,
+    ExportPuzzles(ExportPuzzlesArgs),
 }
 
 #[derive(Args)]
@@ -58,6 +61,12 @@ struct FindRootPuzzlesArgs {
     /// Path to the Playtak database file, to import games into the puzzles database. If not provided, only previously imported games will be analyzed.
     #[arg(short, long)]
     playtak_db_path: Option<String>,
+}
+
+#[derive(Args)]
+struct ExportPuzzlesArgs {
+    #[arg(long)]
+    output_path: String,
 }
 
 fn main() {
@@ -83,6 +92,9 @@ fn main() {
 
         (CliCommands::ShowPuzzle, 5) => show_puzzle::<5>(),
         (CliCommands::ShowPuzzle, 6) => show_puzzle::<6>(),
+
+        (CliCommands::ExportPuzzles(args), 5) => export::export_puzzles::<5>(&args.output_path),
+        (CliCommands::ExportPuzzles(args), 6) => export::export_puzzles::<6>(&args.output_path),
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
