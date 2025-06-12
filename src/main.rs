@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_rusqlite::{from_row, from_rows, to_params_named};
 use tiltak::position::{self, ExpMove, Komi, Move, Position, Role};
-use tiltak::search;
+use tiltak::search::{self, MctsSetting, MonteCarloTree};
 use topaz_tak::board::{Board5, Board6};
 
 const TILTAK_SHALLOW_NODES: u32 = 50_000;
@@ -48,7 +48,7 @@ enum CliCommands {
     /// Gather together full tinue puzzles, and go through them manually
     FindFullPuzzles,
     FindRootGaelets,
-    FindFlatWins,
+    FindImmediateWins,
     ExtendTinuePuzzles,
     ShowPuzzle,
 }
@@ -75,8 +75,8 @@ fn main() {
         (CliCommands::FindRootGaelets, 5) => find_root_gaelets::<5>(),
         (CliCommands::FindRootGaelets, 6) => find_root_gaelets::<6>(),
 
-        (CliCommands::FindFlatWins, 5) => find_movement_flat_wins::<5>(),
-        (CliCommands::FindFlatWins, 6) => find_movement_flat_wins::<6>(),
+        (CliCommands::FindImmediateWins, 5) => find_immediate_wins::<5>(),
+        (CliCommands::FindImmediateWins, 6) => find_immediate_wins::<6>(),
 
         (CliCommands::ExtendTinuePuzzles, 5) => extend_tinue_puzzles::<5>(),
         (CliCommands::ExtendTinuePuzzles, 6) => extend_tinue_puzzles::<6>(),
@@ -127,6 +127,7 @@ struct FinishedPuzzle {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FrontendPuzzle {
     size: usize,
     komi: String,
@@ -143,16 +144,22 @@ struct FrontendPuzzle {
 impl From<FinishedPuzzle> for FrontendPuzzle {
     fn from(puzzle: FinishedPuzzle) -> Self {
         let komi = Komi::from_half_komi(puzzle.half_komi as i8).unwrap();
+        let mut solution: Vec<String> = puzzle
+            .solution
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect();
+        // Puzzle solutions should always have an odd amount of moves
+        // If the data database doesn't, the last move should allow any immediate win
+        if solution.len() % 2 == 0 {
+            solution.push("*".to_string());
+        }
         FrontendPuzzle {
             size: puzzle.size,
             komi: komi.to_string(),
             root_tps: puzzle.root_tps,
             defender_start_move: puzzle.defender_start_move,
-            solution: puzzle
-                .solution
-                .split_whitespace()
-                .map(ToString::to_string)
-                .collect(),
+            solution,
             target_time_seconds: 120, // Default target time for puzzles
             player_white: puzzle.player_white,
             player_black: puzzle.player_black,
@@ -420,178 +427,190 @@ pub struct GaeletRoot<const S: usize> {
     tiltak_second_move_eval: f32,
 }
 
-pub struct MovementFlatWin<const S: usize> {
-    playtak_game_id: u64,
-    komi: Komi,
-    tps: String,
-    winning_moves: Vec<Move<S>>,
-    result_str: &'static str,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImmediateWinRow {
+    pub game_id: u64,
+    pub tps: String,
+    pub tiltak_shallow_alternative_eval: f32,
+    pub tiltak_deep_alternative_eval: Option<f32>,
+    pub num_winning_moves: usize,
+    pub num_winning_origin_squares: usize,
+    pub win_type: WinType,
 }
 
-pub fn find_movement_flat_wins<const S: usize>() {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WinType {
+    Flat,
+    Road,
+    Both,
+}
+
+/// Returns all positions that are immediate wins in the game
+fn immediate_wins<const S: usize>(
+    game: &PlaytakGame,
+    games_processed: &AtomicU64,
+    start_time: &Instant,
+) -> Vec<ImmediateWinRow> {
+    if game.komi.half_komi() != 0 && game.komi.half_komi() != 4 {
+        return vec![];
+    }
+    let mut wins = vec![];
+    let mut position: Position<S> = Position::start_position_with_komi(game.komi);
+    for mv in game
+        .notation
+        .split_whitespace()
+        .map(|move_str| Move::from_string(move_str).unwrap())
+    {
+        assert!(
+            position.move_is_legal(mv),
+            "{} is illegal in #{} on {}, notation: {}",
+            mv,
+            game.id,
+            position.to_fen(),
+            game.notation
+        );
+        position.do_move(mv);
+        if position.game_result().is_some() {
+            continue;
+        }
+        let mut legal_moves = vec![];
+        position.generate_moves(&mut legal_moves);
+
+        let mut winning_moves: Vec<(Move<S>, &str)> = vec![];
+        for mv in legal_moves {
+            let reverse_move = position.do_move(mv);
+            if position.game_result() == Some(GameResult::win_by(!position.side_to_move())) {
+                winning_moves.push((mv, position.pgn_game_result().unwrap()));
+            }
+            position.reverse_move(reverse_move);
+        }
+
+        if !winning_moves.is_empty() {
+            let win_type = if winning_moves
+                .iter()
+                .any(|(_, result_str)| *result_str != winning_moves[0].1)
+            {
+                WinType::Both
+            } else if winning_moves[0].1.contains('F') {
+                WinType::Flat
+            } else {
+                WinType::Road
+            };
+
+            let mut shallow_tree = MonteCarloTree::new(
+                position.clone(),
+                MctsSetting::default()
+                    .arena_size_for_nodes(TILTAK_SHALLOW_NODES)
+                    .exclude_moves(winning_moves.iter().map(|(mv, _)| *mv).collect()),
+            );
+
+            for _ in 0..TILTAK_SHALLOW_NODES {
+                match shallow_tree.select() {
+                    Ok(_) => (),
+                    Err(err) => {
+                        eprintln!("Tiltak search aborted early: {}", err);
+                        break;
+                    }
+                }
+            }
+
+            let (_, shallow_eval) = shallow_tree.best_move().unwrap();
+
+            let deep_eval = if shallow_eval < 0.95 {
+                let mut deep_tree = MonteCarloTree::new(
+                    position.clone(),
+                    MctsSetting::default()
+                        .arena_size_for_nodes(TILTAK_DEEP_NODES)
+                        .exclude_moves(winning_moves.iter().map(|(mv, _)| *mv).collect()),
+                );
+
+                for _ in 0..TILTAK_DEEP_NODES {
+                    match deep_tree.select() {
+                        Ok(_) => (),
+                        Err(err) => {
+                            eprintln!("Tiltak search aborted early: {}", err);
+                            break;
+                        }
+                    }
+                }
+
+                let (_, deep_eval) = deep_tree.best_move().unwrap();
+                Some(deep_eval)
+            } else {
+                None
+            };
+
+            wins.push(ImmediateWinRow {
+                game_id: game.id,
+                tps: position.to_fen(),
+                tiltak_shallow_alternative_eval: shallow_eval,
+                tiltak_deep_alternative_eval: deep_eval,
+                num_winning_moves: winning_moves.len(),
+                num_winning_origin_squares: winning_moves
+                    .iter()
+                    .map(|mv| mv.0.origin_square().into_inner())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                win_type,
+            });
+        }
+    }
+    let games_processed = games_processed.fetch_add(1, Ordering::Relaxed) + 1;
+    if games_processed % 100 == 0 {
+        println!(
+            "Processed {} games in {:.1}",
+            games_processed,
+            start_time.elapsed().as_secs_f32()
+        );
+    }
+    wins
+}
+
+pub fn find_immediate_wins<const S: usize>() {
     let puzzles_conn = Connection::open("puzzles.db").unwrap();
+
+    puzzles_conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS immediate_wins (
+            game_id	INTEGER NOT NULL,
+            tps	TEXT PRIMARY KEY,
+            tiltak_shallow_alternative_eval REAL NOT NULL,
+            tiltak_deep_alternative_eval REAL,
+            num_winning_moves INTEGER NOT NULL,
+            num_winning_origin_squares INTEGER NOT NULL,
+            win_type TEXT NOT NULL,
+            FOREIGN KEY(game_id) REFERENCES games(id)
+            )",
+            [],
+        )
+        .unwrap();
 
     // Check all games for unique flat wins with a spread
     let all_games = read_all_games::<S>(&puzzles_conn);
 
-    let wins: Vec<MovementFlatWin<S>> = all_games
+    let start_time = Instant::now();
+    let games_processed = Arc::new(AtomicU64::new(0));
+
+    println!("Finding immediate wins from {} games", all_games.len());
+
+    let immediate_wins: Vec<ImmediateWinRow> = all_games
         .par_iter()
-        .flat_map(|game| {
-            if game.komi.half_komi() != 0 && game.komi.half_komi() != 4 {
-                return vec![];
-            }
-            let mut wins = vec![];
-            let mut position: Position<S> = Position::start_position_with_komi(game.komi);
-            for mv in game
-                .notation
-                .split_whitespace()
-                .map(|move_str| Move::from_string(move_str).unwrap())
-            {
-                assert!(
-                    position.move_is_legal(mv),
-                    "{} is illegal in #{} on {}, notation: {}",
-                    mv,
-                    game.id,
-                    position.to_fen(),
-                    game.notation
-                );
-                position.do_move(mv);
-                if position.game_result().is_some() {
-                    continue;
-                }
-                let mut legal_moves = vec![];
-                position.generate_moves(&mut legal_moves);
-
-                let mut winning_moves: Vec<(Move<S>, &str)> = vec![];
-                for mv in legal_moves {
-                    let reverse_move = position.do_move(mv);
-                    if position.game_result() == Some(GameResult::win_by(!position.side_to_move()))
-                    {
-                        winning_moves.push((mv, position.pgn_game_result().unwrap()));
-                    }
-                    position.reverse_move(reverse_move);
-                }
-
-                if !winning_moves.is_empty()
-                    && winning_moves.iter().all(|(mv, result_str)| {
-                        !mv.is_placement() && *result_str == winning_moves[0].1
-                    })
-                {
-                    wins.push(MovementFlatWin {
-                        playtak_game_id: game.id,
-                        komi: position.komi(),
-                        tps: position.to_fen(),
-                        winning_moves: winning_moves.iter().map(|e| e.0).collect(),
-                        result_str: winning_moves[0].1,
-                    });
-                }
-            }
-            wins
+        .flat_map(|game| immediate_wins::<S>(game, &games_processed, &start_time))
+        .map_init(|| Connection::open("puzzles.db").unwrap(), |puzzles_conn, win| {
+            puzzles_conn.execute(
+                "INSERT OR IGNORE INTO immediate_wins VALUES (:game_id, :tps, :tiltak_shallow_alternative_eval, :tiltak_deep_alternative_eval, :num_winning_moves, :num_winning_origin_squares, :win_type)",
+                to_params_named(&win).unwrap().to_slice().as_slice()
+            ).unwrap();
+            win
         })
         .collect();
 
     println!(
-        "{} movement-only wins total, {} with flats wins, {} of length 1 or longer, {} of length 2 or longer, {} length 2 or longer from the same square",
-        wins.len(),
-        wins.iter()
-            .filter(|win| win.result_str.contains('F'))
-            .count(),
-        wins.iter()
-            .filter(|win| win.winning_moves.iter().all(|mv| {
-                let ExpMove::Move(_, _, movement) = mv.expand() else {
-                    panic!()
-                };
-                movement.len() > 1
-            }))
-            .count(),
-        wins.iter()
-            .filter(|win| win.winning_moves.iter().all(|mv| {
-                let ExpMove::Move(_, _, movement) = mv.expand() else {
-                    panic!()
-                };
-                movement.len() > 2
-            }))
-            .count(),
-        wins.iter()
-            .filter(|win| win.winning_moves.iter().all(|mv| {
-                let ExpMove::Move(_, _, movement) = mv.expand() else {
-                    panic!()
-                };
-                movement.len() > 2 && mv.origin_square() == win.winning_moves[0].origin_square()
-            }))
-            .count()
+        "Found {} immediate wins from {} total games in {:.1}s",
+        immediate_wins.len(),
+        all_games.len(),
+        start_time.elapsed().as_secs_f32()
     );
-
-    let wins_processed: AtomicU64 = AtomicU64::new(0);
-    let start_time = Instant::now();
-
-    wins.into_par_iter()
-        .filter(|win| {
-            win.result_str.contains('F')
-                || win.winning_moves.iter().all(|mv| {
-                    let ExpMove::Move(_, _, movement) = mv.expand() else {
-                        panic!()
-                    };
-                    movement.len() > 2 && mv.origin_square() == win.winning_moves[0].origin_square()
-                })
-        })
-        .for_each(|win| {
-            let position: Position<S> = Position::from_fen_with_komi(&win.tps, win.komi).unwrap();
-
-            let settings_shallow = search::MctsSetting::default()
-                .arena_size_for_nodes(TILTAK_SHALLOW_NODES)
-                .exclude_moves(win.winning_moves.clone());
-            let mut tree_shallow = search::MonteCarloTree::new(position.clone(), settings_shallow);
-            for _ in 0..TILTAK_SHALLOW_NODES {
-                match tree_shallow.select() {
-                    Ok(_) => (),
-                    Err(err) => {
-                        eprintln!("Tiltak search aborted early: {}", err);
-                        break;
-                    }
-                }
-            }
-            let (_, score_shallow) = tree_shallow.best_move().unwrap();
-
-            if wins_processed.fetch_add(1, Ordering::Relaxed) % 100 == 1 {
-                println!();
-                println!(
-                    "Processed {} wins in {:.1}s",
-                    wins_processed.load(Ordering::Relaxed),
-                    start_time.elapsed().as_secs_f32()
-                )
-            }
-            if score_shallow > 0.8 && !win.result_str.contains('F') {
-                return;
-            }
-
-            let settings_deep = search::MctsSetting::default()
-                .arena_size_for_nodes(TILTAK_DEEP_NODES)
-                .exclude_moves(win.winning_moves);
-            let mut tree_deep = search::MonteCarloTree::new(position.clone(), settings_deep);
-            for _ in 0..TILTAK_DEEP_NODES {
-                match tree_deep.select() {
-                    Ok(_) => (),
-                    Err(err) => {
-                        eprintln!("Tiltak search aborted early: {}", err);
-                        break;
-                    }
-                }
-            }
-            let (best_move, score) = tree_deep.best_move().unwrap();
-
-            if score > 0.6 && !win.result_str.contains('F') {
-                return;
-            }
-
-            println!(
-                "#{}, {}, TPS: {}",
-                win.playtak_game_id, win.result_str, win.tps
-            );
-            println!("Best alternative move: {}, {:.3}", best_move, score);
-
-            println!();
-        });
 }
 
 pub fn find_root_gaelets<const S: usize>() {
