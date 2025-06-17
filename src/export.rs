@@ -23,8 +23,8 @@ struct ExportRow {
     playtak_game_id: usize,
 }
 
-pub fn export_puzzles<const S: usize>(output_path: &str) {
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+pub fn export_puzzles<const S: usize>(input_path: &str, output_path: &str) {
+    let puzzles_conn = Connection::open(input_path).unwrap();
     let tinue_puzzles = read_tinue_puzzles(&puzzles_conn, S);
     let immediate_win_puzzles = read_immediate_win_puzzles::<S>(&puzzles_conn);
 

@@ -29,6 +29,8 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 mod export;
+#[cfg(test)]
+mod tests;
 
 static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 
@@ -37,6 +39,8 @@ static NUM_GAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 struct CliArgs {
     #[arg(short, long)]
     size: usize,
+    #[arg(long, default_value = "puzzles.db")]
+    db_path: String,
     #[command(subcommand)]
     command: CliCommands,
 }
@@ -71,37 +75,42 @@ struct ExportPuzzlesArgs {
 
 fn main() {
     let cli_args = CliArgs::parse();
+    let db_path = cli_args.db_path;
     match (cli_args.command, cli_args.size) {
-        (CliCommands::FindRootPuzzles(args), 5) => main_sized::<5>(&args.playtak_db_path),
-        (CliCommands::FindRootPuzzles(args), 6) => main_sized::<6>(&args.playtak_db_path),
+        (CliCommands::FindRootPuzzles(args), 5) => main_sized::<5>(&args.playtak_db_path, &db_path),
+        (CliCommands::FindRootPuzzles(args), 6) => main_sized::<6>(&args.playtak_db_path, &db_path),
 
-        (CliCommands::FindFollowups, 5) => find_followups::<5>(),
-        (CliCommands::FindFollowups, 6) => find_followups::<6>(),
+        (CliCommands::FindFollowups, 5) => find_followups::<5>(&db_path),
+        (CliCommands::FindFollowups, 6) => find_followups::<6>(&db_path),
 
-        (CliCommands::FindFullPuzzles, 5) => find_full_puzzles::<5>(),
-        (CliCommands::FindFullPuzzles, 6) => find_full_puzzles::<6>(),
+        (CliCommands::FindFullPuzzles, 5) => find_full_puzzles::<5>(&db_path),
+        (CliCommands::FindFullPuzzles, 6) => find_full_puzzles::<6>(&db_path),
 
-        (CliCommands::FindRootGaelets, 5) => find_root_gaelets::<5>(),
-        (CliCommands::FindRootGaelets, 6) => find_root_gaelets::<6>(),
+        (CliCommands::FindRootGaelets, 5) => find_root_gaelets::<5>(&db_path),
+        (CliCommands::FindRootGaelets, 6) => find_root_gaelets::<6>(&db_path),
 
-        (CliCommands::FindImmediateWins, 5) => find_immediate_wins::<5>(),
-        (CliCommands::FindImmediateWins, 6) => find_immediate_wins::<6>(),
+        (CliCommands::FindImmediateWins, 5) => find_immediate_wins::<5>(&db_path),
+        (CliCommands::FindImmediateWins, 6) => find_immediate_wins::<6>(&db_path),
 
-        (CliCommands::ExtendTinuePuzzles, 5) => extend_tinue_puzzles::<5>(),
-        (CliCommands::ExtendTinuePuzzles, 6) => extend_tinue_puzzles::<6>(),
+        (CliCommands::ExtendTinuePuzzles, 5) => extend_tinue_puzzles::<5>(&db_path),
+        (CliCommands::ExtendTinuePuzzles, 6) => extend_tinue_puzzles::<6>(&db_path),
 
-        (CliCommands::ShowPuzzle, 5) => show_puzzle::<5>(),
-        (CliCommands::ShowPuzzle, 6) => show_puzzle::<6>(),
+        (CliCommands::ShowPuzzle, 5) => show_puzzle::<5>(&db_path),
+        (CliCommands::ShowPuzzle, 6) => show_puzzle::<6>(&db_path),
 
-        (CliCommands::ExportPuzzles(args), 5) => export::export_puzzles::<5>(&args.output_path),
-        (CliCommands::ExportPuzzles(args), 6) => export::export_puzzles::<6>(&args.output_path),
+        (CliCommands::ExportPuzzles(args), 5) => {
+            export::export_puzzles::<5>(&db_path, &args.output_path)
+        }
+        (CliCommands::ExportPuzzles(args), 6) => {
+            export::export_puzzles::<6>(&db_path, &args.output_path)
+        }
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
 }
 
 #[derive(Debug)]
-struct PuzzleRoot<const S: usize> {
+pub struct PuzzleRoot<const S: usize> {
     playtak_game_id: u32,
     tps: String,
     solution: Move<S>,
@@ -190,8 +199,8 @@ fn read_random_puzzle(puzzles_conn: &Connection, size: usize) -> FinishedPuzzle 
         .unwrap()[0].clone()
 }
 
-fn show_puzzle<const S: usize>() {
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+fn show_puzzle<const S: usize>(db_path: &str) {
+    let puzzles_conn = Connection::open(db_path).unwrap();
 
     let puzzle: FinishedPuzzle = read_random_puzzle(&puzzles_conn, S);
 
@@ -306,8 +315,8 @@ fn find_last_defending_move<const S: usize>(
 
 /// One-off script for extending solutions to 3-ply tinue puzzles, where the solution was erronously only one move long,
 /// but any defending move leads to an immediate win
-fn extend_tinue_puzzles<const S: usize>() {
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+fn extend_tinue_puzzles<const S: usize>(db_path: &str) {
+    let puzzles_conn = Connection::open(db_path).unwrap();
 
     let tinue_puzzles: Vec<FullTinuePuzzle> = puzzles_conn
         .prepare("SELECT * FROM full_tinue_puzzles WHERE end_in_road = 0")
@@ -379,7 +388,7 @@ fn extend_tinue_puzzles<const S: usize>() {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TinueFollowup<const S: usize> {
+pub struct TinueFollowup<const S: usize> {
     parent_tps: String,
     #[serde(deserialize_with = "deseralize_move")]
     parent_move: Move<S>,
@@ -423,7 +432,8 @@ impl<const S: usize> TinueFollowup<S> {
     }
 }
 
-enum PuzzleF<const S: usize> {
+#[derive(Debug)]
+pub enum PuzzleF<const S: usize> {
     UniqueTinue(TinueFollowup<S>),
     NonUniqueTinue,
     UniqueRoadWin(Move<S>, Move<S>),
@@ -578,8 +588,8 @@ fn immediate_wins<const S: usize>(
     wins
 }
 
-pub fn find_immediate_wins<const S: usize>() {
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+pub fn find_immediate_wins<const S: usize>(db_path: &str) {
+    let puzzles_conn = Connection::open(db_path).unwrap();
 
     puzzles_conn
         .execute(
@@ -608,7 +618,7 @@ pub fn find_immediate_wins<const S: usize>() {
     let immediate_wins: Vec<ImmediateWinRow> = all_games
         .par_iter()
         .flat_map(|game| immediate_wins::<S>(game, &games_processed, &start_time))
-        .map_init(|| Connection::open("puzzles.db").unwrap(), |puzzles_conn, win| {
+        .map_init(|| Connection::open(db_path).unwrap(), |puzzles_conn, win| {
             puzzles_conn.execute(
                 "INSERT OR IGNORE INTO immediate_wins VALUES (:game_id, :tps, :tiltak_shallow_alternative_eval, :tiltak_deep_alternative_eval, :num_winning_moves, :num_winning_origin_squares, :win_type)",
                 to_params_named(&win).unwrap().to_slice().as_slice()
@@ -625,8 +635,8 @@ pub fn find_immediate_wins<const S: usize>() {
     );
 }
 
-pub fn find_root_gaelets<const S: usize>() {
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+pub fn find_root_gaelets<const S: usize>(db_path: &str) {
+    let puzzles_conn = Connection::open(db_path).unwrap();
 
     let puzzle_roots_0_komi: Vec<GaeletRoot<S>> = puzzles_conn.prepare("SELECT games.id, puzzles.tps, puzzles.solution, puzzles.tiltak_0komi_eval, puzzles.tiltak_0komi_second_move_eval FROM puzzles JOIN games ON puzzles.game_id = games.id
         WHERE games.size = ?1 AND games.komi = 0 AND tinue_length IS NULL AND tinue_avoidance_length IS NULL AND tiltak_0komi_eval > 0.9 AND tiltak_0komi_second_move_eval < 0.6")
@@ -717,7 +727,7 @@ pub fn find_root_gaelets<const S: usize>() {
     }
 }
 
-struct FullTinuePuzzleOption<const S: usize> {
+pub struct FullTinuePuzzleOption<const S: usize> {
     playtak_game_id: u32,
     tps: String,
     root_tinue_length: usize,
@@ -852,6 +862,23 @@ fn insert_full_puzzles<const S: usize>(
         .collect::<HashMap<u64, PlaytakGame>>();
 
     let num_puzzles = puzzles.len();
+    let num_single_solution_to_road = puzzles
+        .iter()
+        .filter(|puzzle| matches!(puzzle.single_solution(), Some((_, true))))
+        .count();
+    let num_to_road = puzzles
+        .iter()
+        .filter(|puzzle| {
+            puzzle
+                .solutions
+                .iter()
+                .any(|(_, goes_to_road)| *goes_to_road)
+        })
+        .count();
+    println!(
+        "Got {} full puzzles, {} with single solution to road, {} with at least one solution that goes to road",
+        num_puzzles, num_single_solution_to_road, num_to_road
+    );
 
     for (i, puzzle) in puzzles.iter().enumerate() {
         let playtak_game = &playtak_games_map[&(puzzle.playtak_game_id as u64)];
@@ -951,8 +978,8 @@ fn insert_full_puzzles<const S: usize>(
     }
 }
 
-fn find_full_puzzles<const S: usize>() {
-    let mut puzzles_conn = Connection::open("puzzles.db").unwrap();
+fn find_full_puzzles<const S: usize>(db_path: &str) {
+    let mut puzzles_conn = Connection::open(db_path).unwrap();
 
     let puzzle_roots: Vec<PuzzleRoot<S>> = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
         WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7)")
@@ -970,9 +997,19 @@ fn find_full_puzzles<const S: usize>() {
         .map(|row| row.unwrap())
         .collect();
 
+    println!("Found {} puzzles roots", puzzle_roots.len());
+    let full_tinues: Vec<FullTinuePuzzleOption<S>> =
+        extract_possible_full_tinues(&mut puzzles_conn, &puzzle_roots);
+
+    insert_full_puzzles(&mut puzzles_conn, &full_tinues);
+}
+
+pub fn extract_possible_full_tinues<const S: usize>(
+    puzzles_conn: &mut Connection,
+    puzzle_roots: &[PuzzleRoot<S>],
+) -> Vec<FullTinuePuzzleOption<S>> {
     let mut full_tinues: Vec<FullTinuePuzzleOption<S>> = vec![];
 
-    println!("Found {} puzzles roots", puzzle_roots.len());
     for puzzle_root in puzzle_roots.iter() {
         let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
 
@@ -981,12 +1018,7 @@ fn find_full_puzzles<const S: usize>() {
 
         position.do_move(puzzle_root.solution);
 
-        find_followup_recursive(
-            &mut puzzles_conn,
-            &mut position,
-            &mut moves,
-            &mut possible_lines,
-        );
+        find_followup_recursive(puzzles_conn, &mut position, &mut moves, &mut possible_lines);
 
         let tinue = FullTinuePuzzleOption {
             playtak_game_id: puzzle_root.playtak_game_id,
@@ -997,7 +1029,7 @@ fn find_full_puzzles<const S: usize>() {
         full_tinues.push(tinue);
     }
 
-    insert_full_puzzles(&mut puzzles_conn, &full_tinues);
+    full_tinues
 }
 
 fn find_followup_recursive<const S: usize>(
@@ -1071,7 +1103,10 @@ fn read_followup<const S: usize>(puzzles_db: &mut Connection, tps: &str) -> Vec<
     result
 }
 
-fn find_followup<const S: usize>(puzzle_root: &PuzzleRoot<S>, stats: &Stats) -> Vec<PuzzleF<S>> {
+pub fn find_followup<const S: usize>(
+    puzzle_root: &PuzzleRoot<S>,
+    stats: &Stats,
+) -> Vec<PuzzleF<S>> {
     let mut position: Position<S> =
         Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
     assert!(position.move_is_legal(puzzle_root.solution));
@@ -1191,7 +1226,7 @@ fn read_road_win_followup<const S: usize>(
     result.and_then(|s| Move::from_string(&s).ok())
 }
 
-fn find_followups<const S: usize>() {
+fn find_followups<const S: usize>(db_path: &str) {
     let stats = Arc::new(Stats::default());
 
     let puzzles_conn = Connection::open("puzzles.db").unwrap();
@@ -1306,7 +1341,7 @@ fn find_followups<const S: usize>() {
     let num_root_puzzles = puzzle_roots.len();
 
     puzzle_roots.par_iter().for_each_init(
-        || Connection::open("puzzles.db").unwrap(),
+        || Connection::open(db_path).unwrap(),
         |conn, puzzle_root| {
             let followups = find_followup(puzzle_root, &stats);
 
@@ -1466,12 +1501,12 @@ fn import_playtak_db(playtak_db: &mut Connection, puzzles_db: &mut Connection, s
 }
 
 #[allow(unused)]
-fn main_sized<const S: usize>(playtak_db_name: &Option<String>) {
+fn main_sized<const S: usize>(playtak_db_name: &Option<String>, db_path: &str) {
     let start_time = Instant::now();
     let stats = Arc::new(Stats::default());
     let games_processed = Arc::new(AtomicU64::new(0));
 
-    let mut puzzles_pool = Connection::open("puzzles.db").unwrap();
+    let mut puzzles_pool = Connection::open(db_path).unwrap();
 
     if let Some(playtak_db_name) = playtak_db_name {
         let mut db_conn = Connection::open(playtak_db_name).unwrap();
@@ -1529,7 +1564,7 @@ fn main_sized<const S: usize>(playtak_db_name: &Option<String>) {
     let relevant_games = read_processed_games::<S>(&puzzles_pool);
 
     relevant_games.par_iter().for_each_init(
-        || Connection::open("puzzles.db").unwrap(),
+        || Connection::open(db_path).unwrap(),
         |puzzle_conn, game| {
             for possible_puzzle in generate_possible_puzzle::<S>(&stats, game) {
                 if let Some(TopazAvoidanceResult::NoDefense) = possible_puzzle.topaz_tinue_avoidance
@@ -2061,7 +2096,7 @@ struct TinueAvoidance<const S: usize> {
 }
 
 #[derive(Default)]
-struct Stats {
+pub struct Stats {
     topaz_tinue_first: TimeTracker,
     topaz_tinue_second: TimeTracker,
     topaz_tinue_avoidance: TimeTracker,
