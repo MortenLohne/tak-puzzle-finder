@@ -1,6 +1,11 @@
-use tiltak::position::Move;
+use board_game_traits::Position as PositionTrait;
+use pgn_traits::PgnPosition;
+use tiltak::position::{Move, Position};
 
-use crate::{PuzzleF, PuzzleRoot, Stats, find_followup, find_followups, find_full_puzzles};
+use crate::{
+    PuzzleF, PuzzleRoot, Stats, find_followup, find_followups, find_full_puzzles,
+    followups::extract_possible_full_tinues,
+};
 
 #[test]
 pub fn find_followups_test() {
@@ -50,4 +55,62 @@ fn full_test() {
 
     find_followups::<6>(db_path);
     find_full_puzzles::<6>(&db_path)
+}
+
+#[test]
+fn find_full_tinue_test1() {
+    find_full_tinue_prop::<6>(
+        "212,x,1,1,1,1/x3,1,x2/12,2S,11C,x,2S,x/21S,2,21212C,1S,221,x/x,2,2,2,1,2/2,2,x,2,1221S,x 1 30",
+        "2c4>11*",
+        &["2c4>11*", "d2>", "3e1+", "d1>", "4e2-", "f2<", "5e1+"],
+    );
+}
+
+#[test]
+fn find_full_tinue_test2() {
+    find_full_tinue_prop::<6>(
+        "1,1,221S,1,12,x/x,2,2,x,12,1/x2,1,2,212C,x/x,2,2221S,1,1S,2/2,2,2,121,x2/2,x2,1121C,x,1 1 36",
+        "3d1+",
+        &["3d1+", "Sd5", "e1"],
+    );
+}
+
+fn find_full_tinue_prop<const S: usize>(
+    tps: &str,
+    solution: &str,
+    possible_solution: &[&'static str],
+) {
+    let mut position: Position<S> = Position::from_fen(tps).unwrap();
+    let mv = Move::from_string(solution).unwrap();
+    assert!(position.move_is_legal(mv), "Move is not legal in position");
+    position.do_move(mv);
+
+    let stats = Stats::default();
+
+    let candidate_tinue = extract_possible_full_tinues(position, &stats);
+
+    let possible_solution: Vec<Move<S>> = possible_solution
+        .into_iter()
+        .map(|move_string| Move::from_string(move_string).unwrap())
+        .collect();
+
+    for (tinue, goes_to_road) in candidate_tinue.solutions.iter() {
+        println!(
+            "Tinue goes to road: {}, solution: {}",
+            goes_to_road,
+            tinue
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    assert!(
+        candidate_tinue
+            .solutions
+            .iter()
+            .any(|(solution, _)| solution.starts_with(&possible_solution)),
+        "Solution tinue not found in full tinues"
+    );
 }

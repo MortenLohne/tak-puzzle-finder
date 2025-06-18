@@ -29,6 +29,7 @@ const TOPAZ_SECOND_MOVE_NODES: usize = 20_000_000;
 const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 mod export;
+mod followups;
 #[cfg(test)]
 mod tests;
 
