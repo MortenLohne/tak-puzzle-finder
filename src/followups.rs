@@ -5,13 +5,12 @@ use std::{
 
 use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
-use rand::seq::IndexedRandom;
 use rayon::prelude::*;
 use tiltak::position::{Komi, Move, Position};
 
 use crate::{
     NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TILTAK_SHALLOW_NODES,
-    TinueFollowup, TopazResult, tiltak_search, topaz_search,
+    TinueFollowup, TopazResult, find_last_defending_move, tiltak_search, topaz_search,
 };
 
 pub fn find_followups<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) {
@@ -147,52 +146,24 @@ fn find_followup_recursive<const S: usize>(
     stats: &Stats,
     possible_lines: &mut Vec<(Vec<Move<S>>, bool)>,
 ) {
-    let followups = find_followup::<S>(position.clone(), stats);
-
-    if followups.iter().all(|followup| {
-        matches!(
-            followup,
-            PuzzleF::UniqueRoadWin(_, _) | PuzzleF::NonUniqueRoadWin
-        )
-    }) {
-        // TODO: If all defending moves lead to an immediate road win, use heuristics to find the best one
-        let mut legal_moves = vec![];
-        position.generate_moves(&mut legal_moves);
-        let random_move = *legal_moves
-            .choose(&mut rand::rng())
-            .expect("No legal moves found");
-
-        let reverse_move = position.do_move(random_move);
-        moves.push(random_move);
-
-        let mut unique_winning_move: Option<Move<S>> = None;
-        let mut legal_child_moves = vec![];
-        position.generate_moves(&mut legal_child_moves);
-        for legal_move in legal_child_moves {
-            let reverse_move = position.do_move(legal_move);
-            if position.game_result() == Some(GameResult::win_by(!position.side_to_move())) {
-                if unique_winning_move.is_some() {
-                    // Winning move wasn't unique
-                    unique_winning_move = None;
-                    position.reverse_move(reverse_move);
-                    break;
-                }
-                unique_winning_move = Some(legal_move);
-            }
-            position.reverse_move(reverse_move);
+    // Check if we're one move (two ply) away from a road win
+    // If so, return early
+    if let Some((last_move, unique_win)) = find_last_defending_move(position) {
+        moves.push(last_move);
+        if let Some(unique_move) = unique_win {
+            moves.push(unique_move);
         }
-        if let Some(unique_winning_move) = unique_winning_move {
-            moves.push(unique_winning_move);
-        }
-
         possible_lines.push((moves.clone(), true));
-        if unique_winning_move.is_some() {
+        if unique_win.is_some() {
             moves.pop();
         }
-        position.reverse_move(reverse_move);
         moves.pop();
         return;
     }
+
+    let followups = find_followup::<S>(position.clone(), stats);
+
+    // We know that the position is tinue, but not a 2-ply win, so ignore those
     let followups = followups
         .into_iter()
         .filter_map(|followup| match followup {
