@@ -75,6 +75,17 @@ fn find_full_tinue_test2() {
     );
 }
 
+#[test]
+fn find_full_tinue_test3() {
+    find_full_tinue_prop::<6>(
+        "2,x2,1,x2/2,1S,x,1,x2/221S,2,2,1121C,x2/x,12C,1S,112,x,212S/2,2,2,2,1S,1/2,x4,1 1 22",
+        "3d4-12",
+        &[
+            "3d4-12", "Sd1", "d2+", "c4>", "4d3+", "3f3<12", "d4-", "Sf3", "d3+",
+        ],
+    );
+}
+
 fn find_full_tinue_prop<const S: usize>(
     tps: &str,
     solution: &str,

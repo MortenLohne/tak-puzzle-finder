@@ -1,19 +1,45 @@
 use std::{
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
 use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
 use rayon::prelude::*;
+use rusqlite::Connection;
 use tiltak::position::{Komi, Move, Position};
 
 use crate::{
-    NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TILTAK_SHALLOW_NODES,
-    TinueFollowup, TopazResult, find_last_defending_move, tiltak_search, topaz_search,
+    NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TinueFollowup, TopazResult,
+    find_last_defending_move, tiltak_search, topaz_search,
 };
 
-pub fn find_followups<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) {
+pub fn find_all_from_db<const S: usize>(db_path: &str) {
+    let puzzles_conn = Connection::open(db_path).unwrap();
+    let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
+        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7) ORDER BY RANDOM()")
+    .unwrap();
+    let puzzle_roots: Vec<PuzzleRoot<S>> = stmt
+        .query([S])
+        .unwrap()
+        .mapped(|row| {
+            Ok(PuzzleRoot {
+                playtak_game_id: row.get::<_, u32>(3).unwrap(),
+                tps: row.get(0).unwrap(),
+                solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
+                tinue_length: row.get(2).unwrap(),
+            })
+        })
+        .map(|row| row.unwrap())
+        .collect();
+    let candidates = find_all(&puzzle_roots);
+    println!("Found {} candidates", candidates.len());
+}
+
+pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzzleCandidate<S>> {
     let stats = Arc::new(Stats::default());
 
     println!(
@@ -25,98 +51,92 @@ pub fn find_followups<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) {
             .unwrap_or_default()
     );
 
-    let all_tinue_followups: Mutex<Vec<TinueFollowup<S>>> = Mutex::new(vec![]);
-    let road_win_followups: Mutex<Vec<(String, String)>> = Mutex::new(vec![]);
-
     let start_time = Instant::now();
     let num_root_puzzles = puzzle_roots.len();
 
-    puzzle_roots.par_iter().for_each(|puzzle_root| {
-        let position = Position::from_fen(&puzzle_root.tps).unwrap();
-        let followups = find_followup(position, &stats);
+    let num_goes_to_road = AtomicU64::new(0);
+    let num_single_solution_to_road = AtomicU64::new(0);
+    let num_single_solution = AtomicU64::new(0);
 
-        let mut tinue_followups: Vec<TinueFollowup<S>> = followups
-            .iter()
-            .filter_map(|followup| match followup {
-                PuzzleF::UniqueTinue(followup_tinue) => Some(followup_tinue.clone()),
-                _ => None,
-            })
-            .collect();
+    let puzzle_candidates = puzzle_roots
+        .par_iter()
+        .map(|puzzle_root| {
+            let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
+            let mv = puzzle_root.solution;
+            assert!(position.move_is_legal(mv));
+            position.do_move(mv);
 
-        tinue_followups.sort_by(|followup1, followup2| {
-            followup1
-                .score_0komi()
-                .partial_cmp(&followup2.score_0komi())
-                .unwrap()
-                .reverse()
-        });
+            let tinue_candidate = extract_possible_full_tinues(position, &stats);
 
-        let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel);
-        let num_unique_tinues = tinue_followups.len();
-        let num_non_unique_tinues = followups
-            .iter()
-            .filter(|f| matches!(f, PuzzleF::NonUniqueTinue))
-            .count();
-        let num_unique_road_wins = followups
-            .iter()
-            .filter(|f| matches!(f, PuzzleF::UniqueRoadWin(_, _)))
-            .count();
-
-        println!(
-            "{}/{} puzzles processed in {:.1}s, ETA {:.1}s, results for {}:",
-            n,
-            num_root_puzzles,
-            start_time.elapsed().as_secs_f32(),
-            (start_time.elapsed().as_secs_f32() / n as f32) * (num_root_puzzles as f32 - n as f32),
-            puzzle_root
-        );
-        println!(
-            "Got {} unique tinues, {} num_non_unique_tinues, {:?} longest tinue length",
-            num_unique_tinues,
-            num_non_unique_tinues,
-            tinue_followups
-                .first()
-                .map(|tinue| tinue.longest_parent_tinue_length),
-        );
-
-        if !tinue_followups.is_empty() {
-            println!("Followups with unique tinue: ");
-            for followup in tinue_followups.iter() {
-                println!(
-                    "{}: solution {}, score {:.3}, length {}, eval {:.3}, second eval {:.3}",
-                    followup.parent_move,
-                    followup.solution,
-                    followup.score_0komi(),
-                    followup.tinue_length,
-                    followup.tiltak_0komi_eval,
-                    followup.tiltak_0komi_second_move_eval
-                );
-                if followup.score_0komi() > 0.0 || followup.score_2komi() > 0.0 {
-                    all_tinue_followups.lock().unwrap().push(followup.clone());
+            if tinue_candidate.solutions.is_empty() {
+                println!("No solutions found for puzzle root {}", puzzle_root);
+            }
+            if tinue_candidate
+                .solutions
+                .iter()
+                .any(|(_, is_road)| *is_road)
+            {
+                num_goes_to_road.fetch_add(1, Ordering::Relaxed);
+                if tinue_candidate
+                    .solutions
+                    .iter()
+                    .filter(|(_, is_road)| *is_road)
+                    .count()
+                    == 1
+                {
+                    num_single_solution_to_road.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        } else if num_non_unique_tinues > 0 {
+            if tinue_candidate.solutions.len() == 1 {
+                num_single_solution.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel);
+
             println!(
-                "Got no unique tinues, {} non-unique tinues",
-                num_non_unique_tinues
+                "{}/{} puzzles processed in {:.1}s, ETA {:.1}s, results for {}:",
+                n,
+                num_root_puzzles,
+                start_time.elapsed().as_secs_f32(),
+                (start_time.elapsed().as_secs_f32() / n as f32)
+                    * (num_root_puzzles as f32 - n as f32),
+                puzzle_root
             );
-        } else {
-            println!(
-                "Got 0 non unique tinues, {} followups with unique road wins",
-                num_unique_road_wins,
-            );
-            // If all defenses allow us to make a road immediately, choose Tiltak's top defense move, since they're usually sensible
-            let mut position: Position<S> =
-                Position::from_fen_with_komi(&puzzle_root.tps, Komi::default()).unwrap();
-            position.do_move(puzzle_root.solution);
-            let result = tiltak_search(position.clone(), TILTAK_SHALLOW_NODES);
-            road_win_followups
-                .lock()
-                .unwrap()
-                .push((position.to_fen(), result.pv_first[0].to_string()));
-        }
-        println!();
-    });
+            for (tinue, goes_to_road) in tinue_candidate.solutions.iter() {
+                print!(
+                    "Goes to road: {}, solution: {}",
+                    goes_to_road,
+                    tinue
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if tinue.len() % 2 == 0 {
+                    println!(" *");
+                } else {
+                    println!();
+                }
+            }
+            println!();
+
+            if (n + 1) % 10 == 0 {
+                println!(
+                    "{}/{} puzzles go to a road, {}/{} goes to road with single solution, {}/{} puzzles have a single solution",
+                    num_goes_to_road.load(Ordering::Relaxed),
+                    n + 1,
+                    num_single_solution_to_road.load(Ordering::Relaxed),
+                    n + 1,
+                    num_single_solution.load(Ordering::Relaxed),
+                    n + 1,
+                );
+                println!("Time usage stats:");
+                println!("{}", stats);
+            }
+            tinue_candidate
+        })
+        .collect();
+    puzzle_candidates
 }
 
 pub struct TinuePuzzleCandidate<const S: usize> {

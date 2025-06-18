@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fmt::{self, Write};
+use std::fmt::{self, Display, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -59,6 +59,7 @@ enum CliCommands {
     ExtendTinuePuzzles,
     ShowPuzzle,
     ExportPuzzles(ExportPuzzlesArgs),
+    FindFollowupsNew,
 }
 
 #[derive(Args)]
@@ -105,6 +106,8 @@ fn main() {
         (CliCommands::ExportPuzzles(args), 6) => {
             export::export_puzzles::<6>(&db_path, &args.output_path)
         }
+        (CliCommands::FindFollowupsNew, 5) => followups::find_all_from_db::<5>(&db_path),
+        (CliCommands::FindFollowupsNew, 6) => followups::find_all_from_db::<6>(&db_path),
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
@@ -1230,7 +1233,7 @@ fn read_road_win_followup<const S: usize>(
 fn find_followups<const S: usize>(db_path: &str) {
     let stats = Arc::new(Stats::default());
 
-    let puzzles_conn = Connection::open("puzzles.db").unwrap();
+    let puzzles_conn = Connection::open(db_path).unwrap();
     let mut stmt = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
         WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7) AND puzzles.followups_analyzed = 0")
     .unwrap();
@@ -2104,6 +2107,24 @@ pub struct Stats {
     tiltak_tinue: TimeTracker,
     tiltak_non_tinue_short: TimeTracker,
     tiltak_non_tinue_long: TimeTracker,
+}
+
+impl Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Topaz tinue first move: ")?;
+        self.topaz_tinue_first.print_full();
+        write!(f, "Topaz tinue second move: ")?;
+        self.topaz_tinue_second.print_full();
+        write!(f, "Topaz tinue avoidance: ")?;
+        self.topaz_tinue_avoidance.print_full();
+        write!(f, "Tiltak non tinue (short): ")?;
+        self.tiltak_non_tinue_short.print_short();
+        write!(f, "Tiltak non tinue (long): ")?;
+        self.tiltak_non_tinue_long.print_short();
+        write!(f, "Tiltak tinue: ")?;
+        self.tiltak_tinue.print_short();
+        writeln!(f)
+    }
 }
 
 #[derive(Default)]
