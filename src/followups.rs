@@ -10,7 +10,7 @@ use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
 use rayon::prelude::*;
 use rusqlite::Connection;
-use tiltak::position::{ExpMove, Komi, Move, Position};
+use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
 
 use crate::{
     NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TinueFollowup, TopazResult,
@@ -116,7 +116,7 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                         .record(desperado_start_time.elapsed());
                     result
                 } else {
-                    vec![]
+                    None
                 };
                 print!(
                     "Goes to road: {}, solution: {}",
@@ -130,8 +130,8 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 if tinue.len() % 2 == 0 {
                     print!(" *");
                 }
-                if !desperado_defense_only.is_empty() {
-                    print!(" (desperado defense: {})", desperado_defense_only[0].moves.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+                if let Some(desperado_defense_only) = desperado_defense_only {
+                    print!(" (desperado defense: {})", desperado_defense_only.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
                 }
                 println!();
             }
@@ -175,18 +175,18 @@ pub struct TinueLineCandidate<const S: usize> {
 /// Position is a known loss for the side-to-move
 pub fn find_desperado_defense_lines<const S: usize>(
     position: &mut Position<S>,
-) -> Vec<TinueLineCandidate<S>> {
+) -> Option<TinueLineCandidate<S>> {
     if let Some((last_move, unique_win)) = find_last_defending_move(position) {
         let mut moves = vec![last_move];
         if let Some(unique_move) = unique_win {
             moves.push(unique_move);
         }
-        return vec![TinueLineCandidate {
+        return Some(TinueLineCandidate {
             moves,
             goes_to_road: true,
             pure_recaptures_end_sequence: None,
             desperado_defense_skipped: false,
-        }];
+        });
     }
 
     let mut defender_moves = vec![];
@@ -214,7 +214,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
 
     assert!(!defender_moves.is_empty());
 
-    let mut best_result: Vec<TinueLineCandidate<S>> = vec![];
+    let mut best_result: Option<TinueLineCandidate<S>> = None;
 
     'defender_loop: for defender_move in defender_moves {
         let ExpMove::Move(origin_square, direction, stack_movement) = defender_move.expand() else {
@@ -260,14 +260,25 @@ pub fn find_desperado_defense_lines<const S: usize>(
                     return false; // Placements are never trivial recaptures
                 };
                 // If the move is a pure recapture, we can use it
-                mv.destination_square() == defender_move.destination_square()
-                    && position
-                        .top_stones_left_behind_by_move(origin_square, &stack_movement)
-                        .all(|piece| {
-                            piece.is_some_and(|piece| {
-                                piece.color() == position.side_to_move() && piece.is_road_piece()
-                            })
+                let is_pure_spread = position
+                    .top_stones_left_behind_by_move(origin_square, &stack_movement)
+                    .all(|piece| {
+                        piece.is_some_and(|piece| {
+                            piece.color() == position.side_to_move() && piece.is_road_piece()
                         })
+                    });
+                // If the move is a two-long spread using a flat left behind by the previous defending move,
+                // it's also a valid trivial recapture
+                let is_almost_pure_spread = position
+                    .top_stones_left_behind_by_move(origin_square, &stack_movement)
+                    .eq([
+                        None,
+                        Some(Piece::from_role_color(Role::Flat, position.side_to_move())),
+                    ]);
+                let just_got_square = our_squares_gained.contains(&origin_square);
+
+                mv.destination_square() == defender_move.destination_square()
+                    && (is_pure_spread || is_almost_pure_spread || just_got_square)
             },
         );
 
@@ -287,16 +298,16 @@ pub fn find_desperado_defense_lines<const S: usize>(
                     result.pure_recaptures_end_sequence = Some(1); // This is the first pure recapture in the line
                 }
             }
-            if !results.is_empty() {
-                if let Some(best_result) = best_result.first_mut() {
-                    if results[0].pure_recaptures_end_sequence.unwrap()
+            if let Some(result) = results {
+                if let Some(best_result) = best_result.as_mut() {
+                    if result.pure_recaptures_end_sequence.unwrap()
                         > best_result.pure_recaptures_end_sequence.unwrap_or(0)
                     {
                         // If the new result has a longer pure recapture end sequence, replace the best result
-                        *best_result = results[0].clone();
+                        *best_result = result;
                     }
                 } else {
-                    best_result = results;
+                    best_result = Some(result);
                 }
                 position.reverse_move(reverse_move);
                 continue 'defender_loop; // We found a winning followup, so we can skip the rest of the attacker moves
@@ -305,7 +316,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
         position.reverse_move(reverse_move);
         // If we reach here, it means that the attacker has no trivial recapture moves,
         // which in this context means we found a good enough defense.
-        return vec![];
+        return None;
     }
     best_result
 }

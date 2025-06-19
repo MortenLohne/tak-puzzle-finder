@@ -132,7 +132,7 @@ fn find_desperado_defense() {
         "x2,2,1,221,1/2,2,2S,x,1221,x/x,1S,12,2C,2S,12S/x,2,1,21C,221,x/x2,1221,221,1,x/1,1,1,x,2S,x 2 32",
     ).unwrap();
     let tinue_lines = find_desperado_defense_lines(&mut position);
-    assert!(!tinue_lines.is_empty(), "No desperado defense lines found");
+    assert!(tinue_lines.is_some(), "No desperado defense lines found");
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn no_desperado_defense() {
     ).unwrap();
     let tinue_lines = find_desperado_defense_lines(&mut position);
     assert!(
-        tinue_lines.is_empty(),
+        tinue_lines.is_none(),
         "Desperado defense lines found when none expected"
     );
 }
@@ -154,5 +154,53 @@ fn find_desperado_defense2() {
         "x,1,x,2,2,x/1,1,11121C,1,121S,1/2,1,12,12,1,x/2,1,x,2,2,x/2,221S,12C,1S,2,2/2,1,2,212,2,1 2 29",
     ).unwrap();
     let tinue_lines = find_desperado_defense_lines(&mut position);
-    assert!(!tinue_lines.is_empty());
+    assert!(tinue_lines.is_some());
+}
+
+#[test]
+fn find_desperado_defense3() {
+    let mut position: Position<6> = Position::from_fen(
+        "2,2212C,1,2,2,2/x2,11C,212112,2,x/x,1,211,21,21,x/x3,1,x,2S/x,112S,2,x2,1/1,1,1,21S,x2 1 34",
+    ).unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(tinue_lines.is_some());
+}
+
+#[test]
+fn find_desperado_defense4() {
+    // This position's defensive moves (25... 2b4>11) require a non-pure spread
+    // from a flat they just gave us to refute
+    let mut position: Position<6> = Position::from_fen(
+        "11C,x,1,1,x2/1122C,121,1S,1,x2/2,12,x,1,x2/12,112,x,1,1,1/2,2,x4/12,x5 2 25",
+    )
+    .unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(tinue_lines.is_some());
+}
+
+#[test]
+fn no_desperado_defense2() {
+    let mut position: Position<6> = Position::from_fen(
+        "2,2,x4/x,2,x4/2,2,2C,2,21,1/2,21C,12,11,1,2/1,12121,x,1,x2/12,x,1,x2,1 2 20",
+    )
+    .unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines.is_none(),
+        "Desperado defense lines found when none expected"
+    );
+}
+
+#[test]
+fn no_desperado_defense3() {
+    // 37... b5< is not a desperado defense, and requires a more difficult refutation
+    let mut position: Position<6> = Position::from_fen(
+        "2,2,112S,1,1S,221/1,2,121C,21,21,21/1,12,x2,2,2/1,1,11112C,1,2,2/2S,21,x,112,2,x/2,21,x,2,x,1 2 37",
+    )
+    .unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines.is_none(),
+        "Desperado defense lines found when none expected"
+    );
 }
