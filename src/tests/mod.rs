@@ -255,3 +255,24 @@ fn find_desperado_defense4() {
         tinue_lines.map(|line| line.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>())
     );
 }
+
+#[test]
+fn no_desperado_defense4() {
+    // 37... b5< is not a desperado defense, and requires a more difficult refutation
+    let mut position: Position<6> = Position::from_fen(
+        "2,x,1,1,x2/2,x,1,2S,2,x/2,x,2S,1221C,1,x/2,112,x,1,1,x/2,1S,21212C,x,1,1/1,1,2,x2,1 1 23",
+    )
+    .unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines.is_none(),
+        "Desperado defense lines found when none expected: {}",
+        tinue_lines
+            .unwrap()
+            .moves
+            .iter()
+            .map(|m| m.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}

@@ -260,7 +260,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
 
     'defender_loop: for defender_move in defender_moves {
         let ExpMove::Move(origin_square, direction, stack_movement) = defender_move.expand() else {
-            continue 'defender_loop; // Placements are never desperado defenses
+            return None; // Non-losing placements are always a good enough defense
         };
         assert!(position.move_is_legal(defender_move));
         let mut destination_square = origin_square;
@@ -276,7 +276,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
             {
                 // If their move captured our piece on any square except the destination square,
                 // it's not a desperado defense
-                continue 'defender_loop;
+                return None;
             }
             if top_piece.is_some_and(|piece| piece.color() != position.side_to_move())
                 && position.top_stones()[destination_square]
