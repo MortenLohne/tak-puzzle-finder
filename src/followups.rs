@@ -131,7 +131,11 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                     print!(" *");
                 }
                 if let Some(desperado_defense_only) = desperado_defense_only {
-                    print!(" (desperado defense: {})", desperado_defense_only.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+                    print!(" (desperado defense: {}, {})", desperado_defense_only.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "), if desperado_defense_only.only_trivial_recaptures {
+                        "only super-trivial recaptures"
+                    } else {
+                        "contains non-trivial recaptures"
+                    });
                 }
                 println!();
             }
@@ -172,20 +176,40 @@ pub struct TinueLineCandidate<const S: usize> {
     pub desperado_defense_skipped: bool,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesperadoDefenseLine<const S: usize> {
+    pub moves: Vec<Move<S>>,
+    pub only_trivial_recaptures: bool,
+}
+
+impl<const S: usize> Ord for DesperadoDefenseLine<S> {
+    // A higher ordering means a better line for the defender
+    // Prefer lines with non-trivial recaptures, then prefer longer lines
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.only_trivial_recaptures
+            .cmp(&other.only_trivial_recaptures)
+            .then(self.moves.len().cmp(&other.moves.len()))
+    }
+}
+
+impl<const S: usize> PartialOrd for DesperadoDefenseLine<S> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Position is a known loss for the side-to-move
 pub fn find_desperado_defense_lines<const S: usize>(
     position: &mut Position<S>,
-) -> Option<TinueLineCandidate<S>> {
+) -> Option<DesperadoDefenseLine<S>> {
     if let Some((last_move, unique_win)) = find_last_defending_move(position) {
         let mut moves = vec![last_move];
         if let Some(unique_move) = unique_win {
             moves.push(unique_move);
         }
-        return Some(TinueLineCandidate {
+        return Some(DesperadoDefenseLine {
             moves,
-            goes_to_road: true,
-            pure_recaptures_end_sequence: None,
-            desperado_defense_skipped: false,
+            only_trivial_recaptures: true,
         });
     }
 
@@ -214,7 +238,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
 
     assert!(!defender_moves.is_empty());
 
-    let mut best_result: Option<TinueLineCandidate<S>> = None;
+    let mut best_defense: Option<DesperadoDefenseLine<S>> = None;
 
     'defender_loop: for defender_move in defender_moves {
         let ExpMove::Move(origin_square, direction, stack_movement) = defender_move.expand() else {
@@ -252,73 +276,80 @@ pub fn find_desperado_defense_lines<const S: usize>(
 
         let mut attacker_moves = vec![];
         position.generate_moves(&mut attacker_moves);
-        attacker_moves.retain(
-            // Only keep trivial recapture moves, either pure captures,
-            // or captures using a flat left behind by the previous defending move
-            |mv| {
-                let ExpMove::Move(origin_square, _, stack_movement) = mv.expand() else {
-                    return false; // Placements are never trivial recaptures
-                };
-                // If the move is a pure recapture, we can use it
-                let is_pure_spread = position
-                    .top_stones_left_behind_by_move(origin_square, &stack_movement)
-                    .all(|piece| {
-                        piece.is_some_and(|piece| {
-                            piece.color() == position.side_to_move() && piece.is_road_piece()
-                        })
-                    });
-                // If the move is a two-long spread using a flat left behind by the previous defending move,
-                // it's also a valid trivial recapture
-                let is_almost_pure_spread = position
-                    .top_stones_left_behind_by_move(origin_square, &stack_movement)
-                    .eq([
-                        None,
-                        Some(Piece::from_role_color(Role::Flat, position.side_to_move())),
-                    ]);
-                let just_got_square = our_squares_gained.contains(&origin_square);
+        let mut attacker_moves: Vec<(Move<S>, bool)> = attacker_moves
+            .into_iter()
+            .filter_map(
+                // Only keep trivial recapture moves, either pure captures,
+                // or captures using a flat left behind by the previous defending move
+                |mv| {
+                    let ExpMove::Move(origin_square, _, stack_movement) = mv.expand() else {
+                        return None; // Placements are never trivial recaptures
+                    };
+                    // If the move is a pure recapture, we can use it
+                    let is_pure_spread = position
+                        .top_stones_left_behind_by_move(origin_square, &stack_movement)
+                        .all(|piece| {
+                            piece.is_some_and(|piece| {
+                                piece.color() == position.side_to_move() && piece.is_road_piece()
+                            })
+                        });
+                    let is_almost_pure_spread = position
+                        .top_stones_left_behind_by_move(origin_square, &stack_movement)
+                        .eq([
+                            None,
+                            Some(Piece::from_role_color(Role::Flat, position.side_to_move())),
+                        ]);
+                    let just_got_square = our_squares_gained.contains(&origin_square);
+                    if mv.destination_square() == defender_move.destination_square() {
+                        if is_almost_pure_spread && just_got_square
+                            || is_pure_spread && squares_affected.contains(&mv.origin_square())
+                        {
+                            // If the move is a two-long spread using a flat left behind by the previous defending move,
+                            // it's an even more trivial recapture
+                            return Some((mv, true));
+                        } else if is_pure_spread {
+                            // Any pure spreads are less trivial, but we can still use them
+                            return Some((mv, false));
+                        }
+                    }
+                    // Not a trivial recapture
+                    None
+                },
+            )
+            .collect();
 
-                mv.destination_square() == defender_move.destination_square()
-                    && (is_pure_spread || is_almost_pure_spread || just_got_square)
-            },
-        );
+        // We want to try the most trivial recaptures first
+        attacker_moves.sort_by_key(|(_, is_extra_trivial)| *is_extra_trivial);
+        attacker_moves.reverse();
 
-        for attacker_move in attacker_moves {
+        for (attacker_move, is_extra_trivial) in attacker_moves {
             let reverse_attacker_move = position.do_move(attacker_move);
-            let mut results = find_desperado_defense_lines(position);
+            let results = find_desperado_defense_lines(position);
             position.reverse_move(reverse_attacker_move);
 
-            // This always chooses the first line. TODO: Choose smarter
-            for result in results.iter_mut() {
+            // This always chooses the first attacking line as the best. TODO: Choose smarter
+            if let Some(mut result) = results {
                 result.moves.insert(0, attacker_move);
                 result.moves.insert(0, defender_move);
-                result.desperado_defense_skipped = false;
-                if let Some(length) = result.pure_recaptures_end_sequence.as_mut() {
-                    *length += 1; // We added a pure recapture to the end of the line
-                } else {
-                    result.pure_recaptures_end_sequence = Some(1); // This is the first pure recapture in the line
-                }
-            }
-            if let Some(result) = results {
-                if let Some(best_result) = best_result.as_mut() {
-                    if result.pure_recaptures_end_sequence.unwrap()
-                        > best_result.pure_recaptures_end_sequence.unwrap_or(0)
-                    {
-                        // If the new result has a longer pure recapture end sequence, replace the best result
+                result.only_trivial_recaptures = result.only_trivial_recaptures && is_extra_trivial;
+
+                if let Some(best_result) = best_defense.as_mut() {
+                    if result > *best_result {
                         *best_result = result;
                     }
                 } else {
-                    best_result = Some(result);
+                    best_defense = Some(result);
                 }
                 position.reverse_move(reverse_move);
                 continue 'defender_loop; // We found a winning followup, so we can skip the rest of the attacker moves
             }
         }
         position.reverse_move(reverse_move);
-        // If we reach here, it means that the attacker has no trivial recapture moves,
+        // If we reach here, it means that the attacker has no trivial recaptures against this defense,
         // which in this context means we found a good enough defense.
         return None;
     }
-    best_result
+    best_defense
 }
 
 pub fn extract_possible_full_tinues<const S: usize>(
