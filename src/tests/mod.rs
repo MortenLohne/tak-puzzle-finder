@@ -4,7 +4,7 @@ use tiltak::position::{Move, Position};
 
 use crate::{
     PuzzleF, PuzzleRoot, Stats, find_followup, find_followups, find_full_puzzles,
-    followups::extract_possible_full_tinues,
+    followups::{extract_possible_full_tinues, find_desperado_defense_lines},
 };
 
 #[test]
@@ -124,4 +124,35 @@ fn find_full_tinue_prop<const S: usize>(
             .any(|(solution, _)| solution.starts_with(&possible_solution)),
         "Solution tinue not found in full tinues"
     );
+}
+
+#[test]
+fn find_desperado_defense() {
+    let mut position: Position<6> = Position::from_fen(
+        "x2,2,1,221,1/2,2,2S,x,1221,x/x,1S,12,2C,2S,12S/x,2,1,21C,221,x/x2,1221,221,1,x/1,1,1,x,2S,x 2 32",
+    ).unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(!tinue_lines.is_empty(), "No desperado defense lines found");
+}
+
+#[test]
+fn no_desperado_defense() {
+    let mut position: Position<6> = Position::from_fen(
+        "2,2,x,1,2S,1/x,2,x,1,1,1/2,x,21221,1,2,x/x,2221,2,11,x,1112S/2,12111112C,2,221C,1,x/221S,2,2,2,x,1 2 44",
+    ).unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines.is_empty(),
+        "Desperado defense lines found when none expected"
+    );
+}
+
+#[test]
+fn find_desperado_defense2() {
+    // This position's defensive moves require two-length spreads with capstone to refute
+    let mut position: Position<6> = Position::from_fen(
+        "x,1,x,2,2,x/1,1,11121C,1,121S,1/2,1,12,12,1,x/2,1,x,2,2,x/2,221S,12C,1S,2,2/2,1,2,212,2,1 2 29",
+    ).unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(!tinue_lines.is_empty());
 }

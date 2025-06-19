@@ -2107,6 +2107,7 @@ pub struct Stats {
     tiltak_tinue: TimeTracker,
     tiltak_non_tinue_short: TimeTracker,
     tiltak_non_tinue_long: TimeTracker,
+    desperado_defenses: TimeTracker,
 }
 
 impl Display for Stats {
@@ -2123,6 +2124,8 @@ impl Display for Stats {
         self.tiltak_non_tinue_long.print_short();
         write!(f, "Tiltak tinue: ")?;
         self.tiltak_tinue.print_short();
+        write!(f, "Desperado defenses: ")?;
+        self.desperado_defenses.print_short();
         writeln!(f)
     }
 }
