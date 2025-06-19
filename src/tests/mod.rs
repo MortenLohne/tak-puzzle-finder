@@ -227,3 +227,31 @@ fn find_trivial_desperado_defense3() {
         tinue_lines.map(|line| line.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>())
     );
 }
+
+#[test]
+fn find_desperado_defense3() {
+    // This position has many possible defensive moves
+    let mut position: Position<6> = Position::from_fen(
+        "2,2,12,112,1,1/2,2,21,1,x2/1,12,1,1,1,x/x,22212C,12121S,12S,2,2/x,12,2,1,1,1/21,x,1212S,1,x2 1 38",
+    ).unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines.is_some_and(|desperado_defense| !desperado_defense.only_trivial_recaptures)
+    );
+}
+
+#[test]
+fn find_desperado_defense4() {
+    let mut position: Position<6> = Position::from_fen(
+        "2,x,2,x3/x,2,2,2,x2/x3,12112C,x2/x,221S,21S,1221C,x2/x,12,x2,11112121,x/1,2,x,12,1,1 2 31",
+    )
+    .unwrap();
+    let tinue_lines = find_desperado_defense_lines(&mut position);
+    assert!(
+        tinue_lines
+            .as_ref()
+            .is_some_and(|desperado_defense| !desperado_defense.only_trivial_recaptures),
+        "Got desperado defense line: {:?}",
+        tinue_lines.map(|line| line.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>())
+    );
+}

@@ -57,6 +57,7 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
     let num_goes_to_road = AtomicU64::new(0);
     let num_single_solution_to_road = AtomicU64::new(0);
     let num_single_solution = AtomicU64::new(0);
+    let num_one_move_solution_and_no_desperado = AtomicU64::new(0);
 
     let puzzle_candidates = puzzle_roots
         .par_iter()
@@ -68,13 +69,36 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
 
             let tinue_candidate = extract_possible_full_tinues(position.clone(), &stats);
 
+            let desperado_defenses = tinue_candidate
+                .solutions
+                .iter()
+                .map(|(tinue, goes_to_road)| {
+                    if !goes_to_road {
+                        let mut position_clone = position.clone();
+                        for mv in tinue.iter().skip(1) {
+                            assert!(position_clone.move_is_legal(*mv));
+                            position_clone.do_move(*mv);
+                        }
+                        let desperado_start_time = Instant::now();
+                        let result = find_desperado_defense_lines(&mut position_clone);
+                        stats
+                            .desperado_defenses
+                            .record(desperado_start_time.elapsed());
+                        result
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
             if tinue_candidate.solutions.is_empty() {
                 println!("No solutions found for puzzle root {}", puzzle_root);
             }
-            if tinue_candidate
+            let any_solution_goes_to_road = tinue_candidate
                 .solutions
                 .iter()
-                .any(|(_, is_road)| *is_road)
+                .any(|(_, is_road)| *is_road);
+            if any_solution_goes_to_road
             {
                 num_goes_to_road.fetch_add(1, Ordering::Relaxed);
                 if tinue_candidate
@@ -87,11 +111,16 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                     num_single_solution_to_road.fetch_add(1, Ordering::Relaxed);
                 }
             }
+
             if tinue_candidate.solutions.len() == 1 {
                 num_single_solution.fetch_add(1, Ordering::Relaxed);
+                if tinue_candidate.solutions[0].0.len() == 1 && desperado_defenses[0].is_none() {
+                    num_one_move_solution_and_no_desperado.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
-            let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel);
+
+            let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel) + 1;
 
             println!(
                 "{}/{} puzzles processed in {:.1}s, ETA {:.1}s, results for {}:",
@@ -102,22 +131,8 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                     * (num_root_puzzles as f32 - n as f32),
                 puzzle_root
             );
-            for (tinue, goes_to_road) in tinue_candidate.solutions.iter() {
-                let desperado_defense_only = if !goes_to_road {
-                    let mut position_clone = position.clone();
-                    for mv in tinue.iter().skip(1) {
-                        assert!(position_clone.move_is_legal(*mv));
-                        position_clone.do_move(*mv);
-                    }
-                    let desperado_start_time = Instant::now();
-                    let result = find_desperado_defense_lines(&mut position_clone);
-                    stats
-                        .desperado_defenses
-                        .record(desperado_start_time.elapsed());
-                    result
-                } else {
-                    None
-                };
+
+            for ((tinue, goes_to_road), desperado_defense_only) in tinue_candidate.solutions.iter().zip(desperado_defenses.iter()) {
                 print!(
                     "Goes to road: {}, solution: {}",
                     goes_to_road,
@@ -141,15 +156,17 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
             }
             println!();
 
-            if (n + 1) % 10 == 0 {
+            if n % 10 == 0 {
                 println!(
-                    "{}/{} puzzles go to a road, {}/{} goes to road with single solution, {}/{} puzzles have a single solution",
+                    "{}/{} puzzles go to a road, {}/{} goes to road with single solution, {}/{} puzzles have a single solution, {}/{} puzzles only have a 1-long solution and no desperado defense",
                     num_goes_to_road.load(Ordering::Relaxed),
-                    n + 1,
+                    n,
                     num_single_solution_to_road.load(Ordering::Relaxed),
-                    n + 1,
+                    n,
                     num_single_solution.load(Ordering::Relaxed),
-                    n + 1,
+                    n,
+                    num_one_move_solution_and_no_desperado.load(Ordering::Relaxed),
+                    n,
                 );
                 println!("Time usage stats:");
                 println!("{}", stats);
@@ -188,6 +205,7 @@ impl<const S: usize> Ord for DesperadoDefenseLine<S> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.only_trivial_recaptures
             .cmp(&other.only_trivial_recaptures)
+            .reverse()
             .then(self.moves.len().cmp(&other.moves.len()))
     }
 }
