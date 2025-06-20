@@ -4,7 +4,10 @@ use tiltak::position::{Move, Position};
 
 use crate::{
     PuzzleF, PuzzleRoot, Stats, find_followup, find_followups, find_full_puzzles,
-    followups::{DesperadoDefenseLine, extract_possible_full_tinues, find_desperado_defense_lines},
+    followups::{
+        PuzzleCandidateEvaluation, TinueLineCandidate, TinuePuzzleCandidate2,
+        evaluate_puzzle_candidate, extract_possible_full_tinues, find_desperado_defense_lines,
+    },
 };
 
 #[test]
@@ -274,5 +277,80 @@ fn no_desperado_defense4() {
             .map(|m| m.to_string())
             .collect::<Vec<_>>()
             .join(" ")
+    );
+}
+
+#[test]
+// This candidate puzzle has a longest road win line, but also a non-road win line that is only one move shorter
+// Manually review, because the shorter non-road win line is more interesting
+fn review_long_non_road_candidates() {
+    let mut solutions: Vec<TinueLineCandidate<6>> = [
+        "3c6> e5+ e5 d5> d6> 2e5> e6<",
+        "3c6> e5+ e5 2f6- f6 3f5+ f5 d5> d6>",
+        "3c6> e5+ e5 2f6- f6 3f5+ f5 4f6- f6 5f5+ f5 d5> d6>",
+    ]
+    .iter()
+    .map(|move_line| {
+        move_line
+            .split_whitespace()
+            .map(|move_string| Move::from_string(move_string).unwrap())
+            .collect()
+    })
+    .map(|moves| TinueLineCandidate {
+        moves,
+        goes_to_road: false,
+        pure_recaptures_end_sequence: vec![],
+        trivial_desperado_defense_skipped: None,
+    })
+    .collect();
+    solutions.push(TinueLineCandidate {
+        moves: "3c6> e5+ e5 2f6- f6 3f5+ f5 4f6- f6 5f5+ f5 6f6- f6 Sf1 d6>"
+            .split_whitespace()
+            .map(|move_string| Move::from_string(move_string).unwrap())
+            .collect(),
+        goes_to_road: true,
+        pure_recaptures_end_sequence: vec![],
+        trivial_desperado_defense_skipped: None,
+    });
+
+    let candidate = TinuePuzzleCandidate2 {
+        position: Position::start_position(), // Position doesn't matter
+        solutions,
+    };
+
+    let evaluation = evaluate_puzzle_candidate(candidate.clone());
+    assert_eq!(evaluation, PuzzleCandidateEvaluation::ManualReview);
+}
+
+#[test]
+fn prefer_puzzle_candidates_with_walls() {
+    let solutions: Vec<TinueLineCandidate<6>> = [
+        "Ca2 a1 b1 Sb2 b1<",
+        "Ca2 Sa1 b1 Sb2 a2> a1> a2 a1 b2< Sf2 a2-",
+        "Ca2 Sa1 b1 Sb2 a2> a1> a2 Sa1 b2< Sf2 a2-",
+    ]
+    .iter()
+    .map(|move_line| {
+        move_line
+            .split_whitespace()
+            .map(|move_string| Move::from_string(move_string).unwrap())
+            .collect()
+    })
+    .map(|moves| TinueLineCandidate {
+        moves,
+        goes_to_road: true,
+        pure_recaptures_end_sequence: vec![],
+        trivial_desperado_defense_skipped: None,
+    })
+    .collect();
+    let candidate = TinuePuzzleCandidate2 {
+        position: Position::start_position(), // Position doesn't matter
+        solutions,
+    };
+
+    let evaluation = evaluate_puzzle_candidate(candidate.clone());
+    assert_eq!(
+        evaluation,
+        PuzzleCandidateEvaluation::Approve(candidate.solutions[2].clone())
     );
 }

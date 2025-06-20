@@ -204,17 +204,103 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
     puzzle_candidates
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PuzzleCandidateEvaluation<const S: usize> {
+    Approve(TinueLineCandidate<S>),
+    Deny,
+    ManualReview,
+}
+
+pub fn evaluate_candidate_line<const S: usize>(
+    solution: TinueLineCandidate<S>,
+) -> PuzzleCandidateEvaluation<S> {
+    use PuzzleCandidateEvaluation::*;
+
+    if solution.goes_to_road {
+        Approve(solution.clone())
+    } else if solution.moves.len() == 1 {
+        if solution.pure_recaptures_end_sequence.is_empty() {
+            // A single move solution that does not go to a road nor a clear tinue is not a good candidate
+            Deny
+        } else {
+            // Manually review whether the single-move puzzle is interesting enough
+            ManualReview
+        }
+    } else if !solution.pure_recaptures_end_sequence.is_empty() {
+        // Longer puzzles that end in a clear tinue are good candidates
+        Approve(solution.clone())
+    } else {
+        ManualReview
+    }
+}
+
+pub fn evaluate_puzzle_candidate<const S: usize>(
+    candidate: TinuePuzzleCandidate2<S>,
+) -> PuzzleCandidateEvaluation<S> {
+    use PuzzleCandidateEvaluation::*;
+    if candidate.solutions.len() == 1 {
+        return evaluate_candidate_line(candidate.solutions[0].clone());
+    }
+    let any_solution_goes_to_road = candidate
+        .solutions
+        .iter()
+        .any(|solution| solution.goes_to_road);
+
+    let (longest_solution, longest_line_length) = candidate
+        .solutions
+        .iter()
+        .map(|solution| (solution, solution.num_moves()))
+        .max_by_key(|(_, len)| *len)
+        .unwrap();
+
+    let longest_road_line = candidate
+        .solutions
+        .iter()
+        .filter(|solution| solution.goes_to_road)
+        .map(|solution| (solution, solution.num_moves()))
+        .max_by_key(|(_, len)| *len);
+
+    // If the longest line is a road, strictly longer than the others, and at least 2 moves longer than any non-road line,
+    // it's clearly better than the other lines
+    if longest_solution.goes_to_road
+        && candidate.solutions.iter().all(|solution| {
+            solution == longest_solution
+                || if solution.goes_to_road {
+                    solution.num_moves() < longest_solution.num_moves()
+                } else {
+                    (solution.num_moves() + 1) < longest_solution.num_moves()
+                }
+        })
+    {
+        return Approve(longest_solution.clone());
+    }
+
+    // If no road lines exist, but the longest line is strictly longer than the others,
+    // this line is clearly better
+    // Approve it as long as the line is a good puzzle by itself
+    if !any_solution_goes_to_road
+        && candidate.solutions.iter().all(|solution| {
+            solution == longest_solution || solution.num_moves() < longest_solution.num_moves()
+        })
+    {
+        return evaluate_candidate_line(longest_solution.clone());
+    }
+    ManualReview
+}
+
 #[derive(Clone)]
 pub struct TinuePuzzleCandidate<const S: usize> {
     pub position: Position<S>,
     pub solutions: Vec<(Vec<Move<S>>, bool)>,
 }
+
+#[derive(Clone)]
 pub struct TinuePuzzleCandidate2<const S: usize> {
     pub position: Position<S>,
     pub solutions: Vec<TinueLineCandidate<S>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TinueLineCandidate<const S: usize> {
     pub moves: Vec<Move<S>>,
     pub goes_to_road: bool,
@@ -228,6 +314,12 @@ pub struct TinueLineCandidate<const S: usize> {
     // and also refuted by other moves as well, so that the puzzle could not be extended to a road with that move
     // Because of this, the last defending move has been replaced by an immediately losing move
     pub trivial_desperado_defense_skipped: Option<Vec<Move<S>>>,
+}
+
+impl<const S: usize> TinueLineCandidate<S> {
+    pub fn num_moves(&self) -> usize {
+        self.moves.len().div_ceil(2)
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
