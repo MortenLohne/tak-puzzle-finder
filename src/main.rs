@@ -249,10 +249,18 @@ fn find_last_defending_move<const S: usize>(
 ) -> Option<(Move<S>, Option<Move<S>>)> {
     let mut defending_moves = vec![];
     position.generate_moves(&mut defending_moves);
+    find_last_defending_move_among_moves(position, &defending_moves)
+}
+
+fn find_last_defending_move_among_moves<const S: usize>(
+    position: &mut Position<S>,
+    defending_moves: &[Move<S>],
+) -> Option<(Move<S>, Option<Move<S>>)> {
+    assert!(defending_moves.iter().all(|mv| position.move_is_legal(*mv)),);
     let results: Vec<_> = defending_moves
         .into_iter()
         .map(|defending_move| {
-            let reverse_move = position.do_move(defending_move);
+            let reverse_move = position.do_move(*defending_move);
 
             let mut moves = vec![];
             position.generate_moves(&mut moves);
@@ -308,7 +316,7 @@ fn find_last_defending_move<const S: usize>(
         .unwrap();
 
     Some((
-        best_move,
+        *best_move,
         if lowest_winning_moves == 1 {
             winning_response
         } else {

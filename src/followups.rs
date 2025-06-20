@@ -14,7 +14,7 @@ use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
 
 use crate::{
     NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TinueFollowup, TopazResult,
-    find_last_defending_move, tiltak_search, topaz_search,
+    find_last_defending_move, find_last_defending_move_among_moves, tiltak_search, topaz_search,
 };
 
 pub fn find_all_from_db<const S: usize>(db_path: &str) {
@@ -68,6 +68,11 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
             position.do_move(mv);
 
             let tinue_candidate = extract_possible_full_tinues(position.clone(), &stats);
+            let desperado_followup_start_time = Instant::now();
+            let processed_candidate = process_full_tinue(tinue_candidate.clone());
+            stats
+                .desperado_defenses
+                .record(desperado_followup_start_time.elapsed());
 
             let desperado_defenses = tinue_candidate
                 .solutions
@@ -154,6 +159,28 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 }
                 println!();
             }
+            println!("Processed solutions:");
+            for processed_candidate in processed_candidate.solutions {
+                print!(
+                    "Goes to road: {}, solution: {}",
+                    processed_candidate.goes_to_road,
+                    processed_candidate.moves
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if processed_candidate.moves.len() % 2 == 0 {
+                    print!(" *");
+                }
+                if !processed_candidate.pure_recaptures_end_sequence.is_empty() {
+                    print!(" (desperado defense: {})", processed_candidate.pure_recaptures_end_sequence.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+                }
+                if let Some(skipped_line) = processed_candidate.trivial_desperado_defense_skipped {
+                    print!(" (trivial desperado defense skipped: {})", skipped_line.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+                }
+                println!();
+            }
             println!();
 
             if n % 10 == 0 {
@@ -177,9 +204,14 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
     puzzle_candidates
 }
 
+#[derive(Clone)]
 pub struct TinuePuzzleCandidate<const S: usize> {
     pub position: Position<S>,
     pub solutions: Vec<(Vec<Move<S>>, bool)>,
+}
+pub struct TinuePuzzleCandidate2<const S: usize> {
+    pub position: Position<S>,
+    pub solutions: Vec<TinueLineCandidate<S>>,
 }
 
 #[derive(Clone)]
@@ -188,9 +220,14 @@ pub struct TinueLineCandidate<const S: usize> {
     pub goes_to_road: bool,
     // If the line doesn't end in a road,
     // but ends in a position where the attack only has to make pure recaptures until a forced road,
-    // this will be the length of the sequence of pure recaptures, in whole moves
-    pub pure_recaptures_end_sequence: Option<usize>,
-    pub desperado_defense_skipped: bool,
+    // this additional line is stored here
+    // It is not part of the puzzle, because each attacking move may have more than one solution
+    pub pure_recaptures_end_sequence: Vec<Move<S>>,
+    // The last defending move has been modified
+    // A better move was technically available, but it's refuted by a trivial recapture,
+    // and also refuted by other moves as well, so that the puzzle could not be extended to a road with that move
+    // Because of this, the last defending move has been replaced by an immediately losing move
+    pub trivial_desperado_defense_skipped: Option<Vec<Move<S>>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -368,6 +405,92 @@ pub fn find_desperado_defense_lines<const S: usize>(
         return None;
     }
     best_defense
+}
+
+pub fn process_full_tinue<const S: usize>(
+    puzzle: TinuePuzzleCandidate<S>,
+) -> TinuePuzzleCandidate2<S> {
+    let processed_candidates: Vec<_> = puzzle
+        .solutions
+        .into_iter()
+        .map(|(mut solution, goes_to_road)| {
+            let mut position = puzzle.position.clone();
+            for mv in solution.iter().skip(1) {
+                assert!(position.move_is_legal(*mv));
+                position.do_move(*mv);
+            }
+            if goes_to_road {
+                return TinueLineCandidate {
+                    moves: solution.clone(),
+                    goes_to_road: true,
+                    pure_recaptures_end_sequence: vec![],
+                    trivial_desperado_defense_skipped: None,
+                };
+            }
+            if let Some(desperado_result) = find_desperado_defense_lines(&mut position) {
+                if !desperado_result.only_trivial_recaptures {
+                    // If the defense is not super trivial, don't skip it
+                    TinueLineCandidate {
+                        moves: solution.clone(),
+                        goes_to_road: false,
+                        pure_recaptures_end_sequence: desperado_result.moves,
+                        trivial_desperado_defense_skipped: None,
+                    }
+                } else {
+                    // If the defense is trivial, generate a new immediate losing move at the end
+                    // and skip the full defense
+                    let mut defending_moves = vec![];
+                    position.generate_moves(&mut defending_moves);
+                    // Only retain defending moves that lead to an immediate loss
+                    defending_moves.retain(|mv| {
+                        let reverse_move = position.do_move(*mv);
+                        let mut child_moves = vec![];
+                        position.generate_moves(&mut child_moves);
+                        for child_move in child_moves {
+                            let reverse_child_move = position.do_move(child_move);
+                            if position.game_result()
+                                == Some(GameResult::win_by(!position.side_to_move()))
+                            {
+                                position.reverse_move(reverse_child_move);
+                                position.reverse_move(reverse_move);
+                                return true; // This move leads to an immediate win
+                            }
+                            position.reverse_move(reverse_child_move);
+                        }
+                        position.reverse_move(reverse_move);
+                        false // This move does not lead to an immediate win
+                    });
+
+                    let (defender_move, attacker_move) =
+                        find_last_defending_move_among_moves(&mut position, &defending_moves)
+                            .unwrap();
+
+                    solution.push(defender_move);
+                    if let Some(attacker_move) = attacker_move {
+                        solution.push(attacker_move);
+                    }
+
+                    TinueLineCandidate {
+                        moves: solution,
+                        goes_to_road: true,
+                        pure_recaptures_end_sequence: vec![],
+                        trivial_desperado_defense_skipped: Some(desperado_result.moves),
+                    }
+                }
+            } else {
+                TinueLineCandidate {
+                    moves: solution.clone(),
+                    goes_to_road: false,
+                    pure_recaptures_end_sequence: vec![],
+                    trivial_desperado_defense_skipped: None,
+                }
+            }
+        })
+        .collect();
+    TinuePuzzleCandidate2 {
+        position: puzzle.position,
+        solutions: processed_candidates,
+    }
 }
 
 pub fn extract_possible_full_tinues<const S: usize>(
