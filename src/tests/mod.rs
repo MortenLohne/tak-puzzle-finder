@@ -315,11 +315,14 @@ fn review_long_non_road_candidates() {
 
     let candidate = TinuePuzzleCandidate2 {
         position: Position::start_position(), // Position doesn't matter
-        solutions,
+        solutions: solutions.clone(),
     };
 
     let evaluation = evaluate_puzzle_candidate(candidate.clone());
-    assert_eq!(evaluation, PuzzleCandidateEvaluation::ManualReview);
+    assert_eq!(
+        evaluation,
+        PuzzleCandidateEvaluation::ManualReview(solutions[2].clone())
+    );
 }
 
 #[test]

@@ -148,7 +148,7 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 PuzzleCandidateEvaluation::Deny => {
                     num_denied.fetch_add(1, Ordering::Relaxed);
                 }
-                PuzzleCandidateEvaluation::ManualReview => {
+                PuzzleCandidateEvaluation::ManualReview(_) => {
                     num_manual_review.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -176,6 +176,9 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                     print!(" (approved solution)");
                 } else if puzzle_evaluation == PuzzleCandidateEvaluation::Deny {
                     print!(" (denied solution)");
+                }
+                else if puzzle_evaluation == PuzzleCandidateEvaluation::ManualReview(processed_candidate.clone()) {
+                    print!(" (primary candidate solution)");
                 }
                 println!();
             }
@@ -211,7 +214,7 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
 pub enum PuzzleCandidateEvaluation<const S: usize> {
     Approve(TinueLineCandidate<S>),
     Deny,
-    ManualReview,
+    ManualReview(TinueLineCandidate<S>), // Contains the primary candidate solution
 }
 
 pub fn evaluate_candidate_line<const S: usize>(
@@ -220,20 +223,20 @@ pub fn evaluate_candidate_line<const S: usize>(
     use PuzzleCandidateEvaluation::*;
 
     if solution.goes_to_road {
-        Approve(solution.clone())
+        Approve(solution)
     } else if solution.moves.len() == 1 {
         if solution.pure_recaptures_end_sequence.is_empty() {
             // A single move solution that does not go to a road nor a clear tinue is not a good candidate
             Deny
         } else {
             // Manually review whether the single-move puzzle is interesting enough
-            ManualReview
+            ManualReview(solution)
         }
     } else if !solution.pure_recaptures_end_sequence.is_empty() {
         // Longer puzzles that end in a clear tinue are good candidates
-        Approve(solution.clone())
+        Approve(solution)
     } else {
-        ManualReview
+        ManualReview(solution)
     }
 }
 
@@ -268,10 +271,15 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
     if longest_solution.goes_to_road {
         // If the longest solution goes to a road, but a non-road alternative exists that is only one move shorter,
         // send to manual review always
-        if candidate.solutions.iter().any(|solution| {
-            !solution.goes_to_road && (solution.num_moves() + 1) >= longest_solution.num_moves()
-        }) {
-            return ManualReview;
+        if let Some(long_non_road_solution) = candidate
+            .solutions
+            .iter()
+            .filter(|solution| {
+                !solution.goes_to_road && (solution.num_moves() + 1) >= longest_solution.num_moves()
+            })
+            .max_by_key(|solution| solution.num_moves())
+        {
+            return ManualReview(long_non_road_solution.clone());
         }
 
         // Otherwise, if it's strictly longer than all other lines, approve
@@ -310,7 +318,7 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
     {
         return evaluate_candidate_line(longest_solution.clone());
     }
-    ManualReview
+    ManualReview(longest_solution.clone())
 }
 
 #[derive(Clone)]
