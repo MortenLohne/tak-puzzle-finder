@@ -58,6 +58,9 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
     let num_single_solution_to_road = AtomicU64::new(0);
     let num_single_solution = AtomicU64::new(0);
     let num_one_move_solution_and_no_desperado = AtomicU64::new(0);
+    let num_approved = AtomicU64::new(0);
+    let num_denied = AtomicU64::new(0);
+    let num_manual_review = AtomicU64::new(0);
 
     let puzzle_candidates = puzzle_roots
         .par_iter()
@@ -124,7 +127,6 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 }
             }
 
-
             let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::AcqRel) + 1;
 
             println!(
@@ -137,29 +139,20 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 puzzle_root
             );
 
-            for ((tinue, goes_to_road), desperado_defense_only) in tinue_candidate.solutions.iter().zip(desperado_defenses.iter()) {
-                print!(
-                    "Goes to road: {}, solution: {}",
-                    goes_to_road,
-                    tinue
-                        .iter()
-                        .map(|m| m.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                if tinue.len() % 2 == 0 {
-                    print!(" *");
+            let puzzle_evaluation = evaluate_puzzle_candidate(processed_candidate.clone());
+
+            match puzzle_evaluation {
+                PuzzleCandidateEvaluation::Approve(_) => {
+                    num_approved.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(desperado_defense_only) = desperado_defense_only {
-                    print!(" (desperado defense: {}, {})", desperado_defense_only.moves.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "), if desperado_defense_only.only_trivial_recaptures {
-                        "only super-trivial recaptures"
-                    } else {
-                        "contains non-trivial recaptures"
-                    });
+                PuzzleCandidateEvaluation::Deny => {
+                    num_denied.fetch_add(1, Ordering::Relaxed);
                 }
-                println!();
+                PuzzleCandidateEvaluation::ManualReview => {
+                    num_manual_review.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            println!("Processed solutions:");
+
             for processed_candidate in processed_candidate.solutions {
                 print!(
                     "Goes to road: {}, solution: {}",
@@ -176,8 +169,13 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                 if !processed_candidate.pure_recaptures_end_sequence.is_empty() {
                     print!(" (desperado defense: {})", processed_candidate.pure_recaptures_end_sequence.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
                 }
-                if let Some(skipped_line) = processed_candidate.trivial_desperado_defense_skipped {
+                if let Some(skipped_line) = &processed_candidate.trivial_desperado_defense_skipped {
                     print!(" (trivial desperado defense skipped: {})", skipped_line.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+                }
+                if puzzle_evaluation == PuzzleCandidateEvaluation::Approve(processed_candidate.clone()) {
+                    print!(" (approved solution)");
+                } else if puzzle_evaluation == PuzzleCandidateEvaluation::Deny {
+                    print!(" (denied solution)");
                 }
                 println!();
             }
@@ -194,6 +192,11 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
                     n,
                     num_one_move_solution_and_no_desperado.load(Ordering::Relaxed),
                     n,
+                );
+                println!("{} puzzles approved, {} puzzles denied, {} puzzles need manual review",
+                    num_approved.load(Ordering::Relaxed),
+                    num_denied.load(Ordering::Relaxed),
+                    num_manual_review.load(Ordering::Relaxed),
                 );
                 println!("Time usage stats:");
                 println!("{}", stats);
@@ -262,17 +265,39 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
 
     // If the longest line is a road, strictly longer than the others, and at least 2 moves longer than any non-road line,
     // it's clearly better than the other lines
-    if longest_solution.goes_to_road
-        && candidate.solutions.iter().all(|solution| {
-            solution == longest_solution
-                || if solution.goes_to_road {
-                    solution.num_moves() < longest_solution.num_moves()
-                } else {
-                    (solution.num_moves() + 1) < longest_solution.num_moves()
-                }
-        })
-    {
-        return Approve(longest_solution.clone());
+    if longest_solution.goes_to_road {
+        // If the longest solution goes to a road, but a non-road alternative exists that is only one move shorter,
+        // send to manual review always
+        if candidate.solutions.iter().any(|solution| {
+            !solution.goes_to_road && (solution.num_moves() + 1) >= longest_solution.num_moves()
+        }) {
+            return ManualReview;
+        }
+
+        // Otherwise, if it's strictly longer than all other lines, approve
+        if candidate.solutions.iter().all(|solution| {
+            solution == longest_solution || solution.num_moves() < longest_solution.num_moves()
+        }) {
+            return Approve(longest_solution.clone());
+        }
+
+        // If there are multiple longest solutions that go to a road,
+        // find the one with the most blocking defensive placements
+        let longest_solutions = candidate
+            .solutions
+            .iter()
+            .filter(|solution| solution.goes_to_road && solution.num_moves() == longest_line_length)
+            .collect::<Vec<_>>();
+        assert!(longest_solutions.len() >= 2);
+        if let Some(most_blocking_placements) = longest_solutions.iter().find(|solution| {
+            longest_solutions.iter().all(|other_solution| {
+                *solution == other_solution
+                    || solution.num_blocking_defensive_placements()
+                        > other_solution.num_blocking_defensive_placements()
+            })
+        }) {
+            return Approve((*most_blocking_placements).clone());
+        }
     }
 
     // If no road lines exist, but the longest line is strictly longer than the others,
@@ -319,6 +344,17 @@ pub struct TinueLineCandidate<const S: usize> {
 impl<const S: usize> TinueLineCandidate<S> {
     pub fn num_moves(&self) -> usize {
         self.moves.len().div_ceil(2)
+    }
+
+    /// Number of walls/caps placed by the defender in this line
+    pub fn num_blocking_defensive_placements(&self) -> usize {
+        self.moves
+            .iter()
+            .enumerate()
+            .filter(|(i, mv)| {
+                i % 2 == 1 && matches!(mv.expand(), ExpMove::Place(Role::Cap | Role::Wall, _))
+            })
+            .count()
     }
 }
 
