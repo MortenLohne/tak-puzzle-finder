@@ -10,6 +10,8 @@ use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
 use rayon::prelude::*;
 use rusqlite::Connection;
+use serde::Serialize;
+use serde_rusqlite::to_params_named;
 use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
 
 use crate::{
@@ -35,12 +37,58 @@ pub fn find_all_from_db<const S: usize>(db_path: &str) {
         })
         .map(|row| row.unwrap())
         .collect();
-    let candidates = find_all(&puzzle_roots);
+    let candidates = find_all(&puzzle_roots, db_path);
     println!("Found {} candidates", candidates.len());
 }
 
-pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzzleCandidate<S>> {
+fn insert_puzzle_candidate<const S: usize>(
+    conn: &Connection,
+    game_id: u64,
+    puzzle_candidate: &TinuePuzzleCandidate2<S>,
+    root_tps: &str,
+) {
+    let puzzle_line_rows =
+        TinueLineCandidateRow::from_puzzle_candidate(puzzle_candidate.clone(), game_id, root_tps);
+
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR IGNORE INTO candidate_full_solutions
+        VALUES (:game_id, :tps, :solution, :goes_to_road, :pure_recaptures_end_sequence, :trivial_desperado_defense_skipped)",
+        )
+        .unwrap();
+
+    for solution in puzzle_line_rows {
+        stmt.execute(to_params_named(&solution).unwrap().to_slice().as_slice())
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to insert puzzle candidate: tps {} for game_id {}: {}",
+                    solution.tps, game_id, err
+                );
+            });
+    }
+}
+
+pub fn find_all<const S: usize>(
+    puzzle_roots: &[PuzzleRoot<S>],
+    db_path: &str,
+) -> Vec<TinuePuzzleCandidate<S>> {
     let stats = Arc::new(Stats::default());
+
+    // Create a new table for storing the puzzle candidates
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS candidate_full_solutions (
+            game_id INTEGER NOT NULL,
+            tps TEXT NOT NULL,
+            solution TEXT NOT NULL,
+            goes_to_road BOOLEAN NOT NULL,
+            pure_recaptures_end_sequence TEXT NOT NULL,
+            trivial_desperado_defense_skipped TEXT,
+            FOREIGN KEY (tps) REFERENCES puzzles(tps)
+        )",
+        [],
+    )
+    .unwrap();
 
     println!(
         "Got {} puzzles roots, like {}",
@@ -64,7 +112,7 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
 
     let puzzle_candidates = puzzle_roots
         .par_iter()
-        .map(|puzzle_root| {
+        .map_init(||Connection::open(db_path).unwrap(), |conn, puzzle_root| {
             let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
             let mv = puzzle_root.solution;
             assert!(position.move_is_legal(mv));
@@ -76,6 +124,8 @@ pub fn find_all<const S: usize>(puzzle_roots: &[PuzzleRoot<S>]) -> Vec<TinuePuzz
             stats
                 .desperado_defenses
                 .record(desperado_followup_start_time.elapsed());
+
+            insert_puzzle_candidate(conn, puzzle_root.playtak_game_id as u64, &processed_candidate, &puzzle_root.tps);
 
             let desperado_defenses = tinue_candidate
                 .solutions
@@ -259,13 +309,6 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
         .max_by_key(|(_, len)| *len)
         .unwrap();
 
-    let longest_road_line = candidate
-        .solutions
-        .iter()
-        .filter(|solution| solution.goes_to_road)
-        .map(|solution| (solution, solution.num_moves()))
-        .max_by_key(|(_, len)| *len);
-
     // If the longest line is a road, strictly longer than the others, and at least 2 moves longer than any non-road line,
     // it's clearly better than the other lines
     if longest_solution.goes_to_road {
@@ -333,6 +376,55 @@ pub struct TinuePuzzleCandidate2<const S: usize> {
     pub solutions: Vec<TinueLineCandidate<S>>,
 }
 
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+pub struct TinueLineCandidateRow {
+    pub game_id: u64,
+    pub tps: String,
+    pub solution: String,
+    pub goes_to_road: bool,
+    pub pure_recaptures_end_sequence: String,
+    pub trivial_desperado_defense_skipped: Option<String>,
+}
+
+impl TinueLineCandidateRow {
+    fn from_puzzle_candidate<const S: usize>(
+        candidate: TinuePuzzleCandidate2<S>,
+        game_id: u64,
+        root_tps: &str,
+    ) -> Vec<Self> {
+        candidate
+            .solutions
+            .into_iter()
+            .map(|solution| TinueLineCandidateRow {
+                game_id,
+                tps: root_tps.to_string(),
+                solution: solution
+                    .moves
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                goes_to_road: solution.goes_to_road,
+                pure_recaptures_end_sequence: solution
+                    .pure_recaptures_end_sequence
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                trivial_desperado_defense_skipped: solution
+                    .trivial_desperado_defense_skipped
+                    .as_ref()
+                    .map(|v| {
+                        v.iter()
+                            .map(|m| m.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }),
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TinueLineCandidate<const S: usize> {
     pub moves: Vec<Move<S>>,
@@ -351,7 +443,7 @@ pub struct TinueLineCandidate<const S: usize> {
 
 impl<const S: usize> TinueLineCandidate<S> {
     pub fn num_moves(&self) -> usize {
-        self.moves.len().div_ceil(2)
+        self.moves.len() / 2
     }
 
     /// Number of walls/caps placed by the defender in this line
