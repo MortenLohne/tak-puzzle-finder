@@ -30,6 +30,7 @@ const TOPAZ_AVOIDANCE_NODES: usize = 5_000_000;
 
 mod export;
 mod followups;
+mod gaelet;
 #[cfg(test)]
 mod tests;
 
@@ -60,6 +61,7 @@ enum CliCommands {
     ShowPuzzle,
     ExportPuzzles(ExportPuzzlesArgs),
     FindFollowupsNew,
+    FindGaelets,
 }
 
 #[derive(Args)]
@@ -108,6 +110,9 @@ fn main() {
         }
         (CliCommands::FindFollowupsNew, 5) => followups::find_all_from_db::<5>(&db_path),
         (CliCommands::FindFollowupsNew, 6) => followups::find_all_from_db::<6>(&db_path),
+
+        (CliCommands::FindGaelets, 5) => gaelet::find_potential_gaelet::<5>(&db_path),
+        (CliCommands::FindGaelets, 6) => gaelet::find_potential_gaelet::<6>(&db_path),
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }

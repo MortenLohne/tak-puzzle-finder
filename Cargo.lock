@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "addr2line"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfbe277e56a376000877090da837660b4427aad530e3028d44e0bffe4f89a1c1"
+dependencies = [
+ "gimli",
+]
+
+[[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "android-tzdata"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,6 +101,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
+name = "backtrace"
+version = "0.3.75"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6806a6321ec58106fea15becdad98371e28d92ccbc7c8f1b3b6dd724fe8f1002"
+dependencies = [
+ "addr2line",
+ "cfg-if",
+ "libc",
+ "miniz_oxide",
+ "object",
+ "rustc-demangle",
+ "windows-targets",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,6 +138,27 @@ name = "bumpalo"
 version = "3.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "793db76d6187cd04dff33004d8e6c9cc4e05cd330500379d2394209271b4aeee"
+
+[[package]]
+name = "bytes"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
+
+[[package]]
+name = "cataklysm"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "size3",
+ "size4",
+ "size5",
+ "size6",
+ "size7",
+ "size8",
+ "tokio",
+]
 
 [[package]]
 name = "cc"
@@ -189,6 +240,14 @@ name = "colorful"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97af0562545a7d7f3d9222fcf909963bec36dcb502afaacab98c6ffac8da47ce"
+
+[[package]]
+name = "common"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "rand 0.8.5",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -297,6 +356,12 @@ dependencies = [
  "r-efi",
  "wasi 0.14.2+wasi-0.2.4",
 ]
+
+[[package]]
+name = "gimli"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
 name = "half"
@@ -458,6 +523,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,6 +548,15 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -496,6 +579,12 @@ checksum = "dfd96e0880acc28befbafb7e4fa9a1c5b52e3556b7e60ff8dbf11ed0884d2f0f"
 dependencies = [
  "board-game-traits",
 ]
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
 name = "pkg-config"
@@ -526,6 +615,7 @@ name = "puzzle-finder"
 version = "0.1.0"
 dependencies = [
  "board-game-traits",
+ "cataklysm",
  "chrono",
  "clap",
  "lz-str",
@@ -669,6 +759,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "989e6739f80c4ad5b13e0fd7fe89531180375b18520cc8c82080e4dc4035b84f"
+
+[[package]]
 name = "rustversion"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +825,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "size3"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
+name = "size4"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
+name = "size5"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
+name = "size6"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
+name = "size7"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
+name = "size8"
+version = "0.1.0"
+source = "git+https://github.com/MortenLohne/cataklysm#84815ab137f2c6b35363b10b9b76c154c2594b5c"
+dependencies = [
+ "common",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "takparse",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,6 +927,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "takparse"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "510ee448d18cdf6b963c5fe5e6b2daf07cb66dc21a3ed7e906cc17bd461f7677"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "telnet"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,6 +962,29 @@ dependencies = [
  "rand 0.8.5",
  "rand_distr",
  "sysinfo",
+]
+
+[[package]]
+name = "tokio"
+version = "1.45.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75ef51a33ef1da925cea3e4eb122833cb377c61439ca401b770f54902b806779"
+dependencies = [
+ "backtrace",
+ "bytes",
+ "pin-project-lite",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e06d43f1345a3bcd39f6a56dbb7dcab2ba47e68e8ac134855e7e2bdbaf8cab8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
