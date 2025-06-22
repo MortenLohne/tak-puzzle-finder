@@ -10,8 +10,9 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Deserialize;
 use serde_rusqlite::from_rows;
 use tiltak::position::{Komi, Position};
+use topaz_tak::eval;
 
-use crate::NUM_GAMES_PROCESSED;
+use crate::{NUM_GAMES_PROCESSED, PuzzleRoot};
 
 #[derive(Debug, Deserialize)]
 pub struct GaeletRoot<const S: usize> {
@@ -63,7 +64,7 @@ pub fn find_potential_gaelet<const S: usize>(db_path: &str) {
     endgame_gaelet_roots.into_par_iter().for_each(|root| {
         let komi = Komi::from_half_komi(root.half_komi).unwrap();
         let position = Position::<S>::from_fen_with_komi(&root.tps, komi).unwrap();
-        let eval = cataklysm_search(position, &root);
+        let eval = cataklysm_search(position, &root, 13);
         if eval.is_decisive() {
             num_wins_found.fetch_add(1, Ordering::Relaxed);
         }
@@ -82,9 +83,46 @@ pub fn find_potential_gaelet<const S: usize>(db_path: &str) {
     });
 }
 
+pub fn analyze_puzzle_cataklysm<const S: usize>(puzzle: &PuzzleRoot<S>) -> (Eval, String) {
+    let position = Position::<S>::from_fen(&puzzle.tps).unwrap();
+    let max_depth = 9;
+
+    let mut options: Options = Options {
+        half_komi: position.komi().half_komi() as i32,
+        ..Options::default(S).unwrap()
+    };
+
+    options.params.tt_size = 1 << 24; // Set the transposition table size to 512 MiB
+
+    let mut game = new_game(S, options).unwrap();
+    game.set_position(&position.to_fen()).unwrap();
+
+    // let start_time = Instant::now();
+    let mut eval = Eval::ZERO;
+
+    for depth in 1..=max_depth {
+        (eval, _) = game.search(depth).unwrap();
+    }
+
+    // let nodes = game.nodes();
+    let pv = game.pv();
+
+    // println!(
+    //     "Depth: {}, nodes: {}, eval: {}, move: {}, pv: {}, {:.2}s elapsed",
+    //     depth,
+    //     nodes,
+    //     eval,
+    //     mv,
+    //     pv,
+    //     start_time.elapsed().as_secs_f64()
+    // );
+    (eval, pv.to_string())
+}
+
 pub fn cataklysm_search<const S: usize>(
     position: Position<S>,
     gaelet_root: &GaeletRoot<S>,
+    max_depth: u32,
 ) -> Eval {
     let mut options: Options = Options {
         half_komi: position.komi().half_komi() as i32,
@@ -99,38 +137,40 @@ pub fn cataklysm_search<const S: usize>(
     let start_time = Instant::now();
 
     let mut deepest_eval = None;
-    for depth in 11..=11 {
+    for depth in 1..=max_depth {
         let (eval, mv) = game.search(depth).unwrap();
         deepest_eval = Some(eval);
-        let nodes = game.nodes();
-        let pv = game.pv();
-        println!(
-            "#{}: Komi: {}, tps: {}",
-            gaelet_root.playtak_game_id,
-            position.komi(),
-            position.to_fen()
-        );
-        if gaelet_root.half_komi == 0 {
-            print!(
-                "Tiltak 0 komi eval: {:.3}, second move eval: {:.3}",
-                gaelet_root.tiltak_0komi_eval, gaelet_root.tiltak_0komi_second_move_eval
+        if depth == max_depth {
+            let nodes = game.nodes();
+            let pv = game.pv();
+            println!(
+                "#{}: Komi: {}, tps: {}",
+                gaelet_root.playtak_game_id,
+                position.komi(),
+                position.to_fen()
             );
-        } else {
-            print!(
-                "Tiltak 2 komi eval: {:.3}, second move eval: {:.3}",
-                gaelet_root.tiltak_2komi_eval, gaelet_root.tiltak_2komi_second_move_eval
+            if gaelet_root.half_komi == 0 {
+                print!(
+                    "Tiltak 0 komi eval: {:.3}, second move eval: {:.3}",
+                    gaelet_root.tiltak_0komi_eval, gaelet_root.tiltak_0komi_second_move_eval
+                );
+            } else {
+                print!(
+                    "Tiltak 2 komi eval: {:.3}, second move eval: {:.3}",
+                    gaelet_root.tiltak_2komi_eval, gaelet_root.tiltak_2komi_second_move_eval
+                );
+            }
+            println!(", reserves left: {}", reserves_left_for_us(&position));
+            println!(
+                "Depth: {}, nodes: {}, eval: {}, move: {}, pv: {}, {:.2}s elapsed",
+                depth,
+                nodes,
+                eval,
+                mv,
+                pv,
+                start_time.elapsed().as_secs_f64()
             );
         }
-        println!(", reserves left: {}", reserves_left_for_us(&position));
-        println!(
-            "Depth: {}, nodes: {}, eval: {}, move: {}, pv: {}, {:.2}s elapsed",
-            depth,
-            nodes,
-            eval,
-            mv,
-            pv,
-            start_time.elapsed().as_secs_f64()
-        );
     }
     println!();
     deepest_eval.unwrap()

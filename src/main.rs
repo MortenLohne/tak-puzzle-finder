@@ -21,6 +21,8 @@ use tiltak::position::{self, ExpMove, Komi, Move, Position, Role};
 use tiltak::search::{self, MctsSetting, MonteCarloTree};
 use topaz_tak::board::{Board5, Board6};
 
+use crate::gaelet::analyze_puzzle_cataklysm;
+
 const TILTAK_SHALLOW_NODES: u32 = 50_000;
 const TILTAK_DEEP_NODES: u32 = 2_000_000;
 
@@ -62,6 +64,8 @@ enum CliCommands {
     ExportPuzzles(ExportPuzzlesArgs),
     FindFollowupsNew,
     FindGaelets,
+    /// Analyze puzzles already in the database with Cataklysm
+    AnalyzePuzzles,
 }
 
 #[derive(Args)]
@@ -114,6 +118,9 @@ fn main() {
         (CliCommands::FindGaelets, 5) => gaelet::find_potential_gaelet::<5>(&db_path),
         (CliCommands::FindGaelets, 6) => gaelet::find_potential_gaelet::<6>(&db_path),
 
+        (CliCommands::AnalyzePuzzles, 5) => analyze_puzzles_cataklysm::<5>(&db_path),
+        (CliCommands::AnalyzePuzzles, 6) => analyze_puzzles_cataklysm::<6>(&db_path),
+
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
 }
@@ -142,6 +149,58 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     Move::from_string(&s).map_err(serde::de::Error::custom)
+}
+
+pub fn analyze_puzzles_cataklysm<const S: usize>(db_name: &str) {
+    let puzzles_conn = rusqlite::Connection::open(db_name).unwrap();
+
+    let puzzle_roots: Vec<PuzzleRoot<S>> = puzzles_conn.prepare("SELECT puzzles.tps, puzzles.solution, puzzles.tinue_length, games.id FROM puzzles JOIN games ON puzzles.game_id = games.id
+        WHERE games.size = ?1 AND puzzles.tinue_length NOT NULL AND (tiltak_0komi_second_move_eval < 0.7 OR tiltak_2komi_second_move_eval < 0.7)")
+    .unwrap()
+        .query([S])
+        .unwrap()
+        .mapped(|row| {
+            Ok(PuzzleRoot {
+                playtak_game_id: row.get::<_, u32>(3).unwrap(),
+                tps: row.get(0).unwrap(),
+                solution: Move::from_string(&row.get::<_, String>(1).unwrap()).unwrap(),
+                tinue_length: row.get(2).unwrap(),
+            })
+        })
+        .map(|row| row.unwrap())
+        .collect();
+
+    println!("Found {} puzzles roots", puzzle_roots.len());
+
+    let num_wins = AtomicU64::new(0);
+    let num_no_wins = AtomicU64::new(0);
+    let start_time = Instant::now();
+
+    puzzle_roots.into_par_iter().for_each(|puzzle| {
+        let (eval, _pv) = analyze_puzzle_cataklysm(&puzzle);
+        if eval.is_decisive() {
+            num_wins.fetch_add(1, Ordering::Relaxed);
+        } else {
+            num_no_wins.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = num_wins.load(Ordering::Relaxed) + num_no_wins.load(Ordering::Relaxed);
+        if n % 100 == 0 {
+            println!(
+                "Processed {} puzzles, found {} wins, no wins {} in {:.1}s",
+                n,
+                num_wins.load(Ordering::Relaxed),
+                num_no_wins.load(Ordering::Relaxed),
+                start_time.elapsed().as_secs_f64()
+            );
+        }
+    });
+    println!(
+        "Processed {} puzzles, found {} wins, no wins {} in {:.1}s",
+        num_wins.load(Ordering::Relaxed) + num_no_wins.load(Ordering::Relaxed),
+        num_wins.load(Ordering::Relaxed),
+        num_no_wins.load(Ordering::Relaxed),
+        start_time.elapsed().as_secs_f64()
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
