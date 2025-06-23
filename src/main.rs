@@ -176,12 +176,13 @@ pub fn analyze_games_cataklysm<const S: usize>(db_name: &str) {
                 let mv = Move::from_string(mv).unwrap();
                 assert!(position.move_is_legal(mv));
                 position.do_move(mv);
-                if position.half_moves_played() < 6 {
+                // Tinue is only possible after white has played S - 2 moves
+                if position.half_moves_played() < (S - 2) * 2 {
                     continue;
                 }
 
                 let mut stmt = conn
-                    .prepare("SELECT * FROM puzzles WHERE tps = ?1")
+                    .prepare("SELECT * FROM puzzles WHERE tps = ?1 AND tinue_length IS NOT NULL")
                     .unwrap();
                 let mut rows = stmt.query([position.to_fen()]).unwrap();
                 if rows.next().unwrap().is_some() {
@@ -200,7 +201,7 @@ pub fn analyze_games_cataklysm<const S: usize>(db_name: &str) {
                         let tiltak_result = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
                         stats.tiltak_tinue.record(tiltak_start_time.elapsed());
                         let tiltak_delta = tiltak_result.score_first - tiltak_result.score_second;
-                        if reserves_left_for_us(&position) > 4 || tiltak_delta > 0.1 {
+                        if reserves_left_for_us(&position) > 4 || tiltak_result.score_first < 0.9 || tiltak_delta > 0.1 {
                             println!(
                                 "Found decisive non-tinue eval \"{}\", {} reserves left, pv {} at # {}",
                                 eval,
