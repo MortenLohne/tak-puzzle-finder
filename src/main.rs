@@ -21,7 +21,7 @@ use tiltak::position::{self, ExpMove, Komi, Move, Position, Role};
 use tiltak::search::{self, MctsSetting, MonteCarloTree};
 use topaz_tak::board::{Board5, Board6};
 
-use crate::gaelet::analyze_puzzle_cataklysm;
+use crate::gaelet::{analyze_puzzle_cataklysm, cataklysm_search, reserves_left_for_us};
 
 const TILTAK_SHALLOW_NODES: u32 = 50_000;
 const TILTAK_DEEP_NODES: u32 = 2_000_000;
@@ -66,6 +66,8 @@ enum CliCommands {
     FindGaelets,
     /// Analyze puzzles already in the database with Cataklysm
     AnalyzePuzzles,
+    /// Anazlyze all games in the database with Cataklysm
+    AnalyzeGames,
 }
 
 #[derive(Args)]
@@ -121,6 +123,9 @@ fn main() {
         (CliCommands::AnalyzePuzzles, 5) => analyze_puzzles_cataklysm::<5>(&db_path),
         (CliCommands::AnalyzePuzzles, 6) => analyze_puzzles_cataklysm::<6>(&db_path),
 
+        (CliCommands::AnalyzeGames, 5) => analyze_games_cataklysm::<5>(&db_path),
+        (CliCommands::AnalyzeGames, 6) => analyze_games_cataklysm::<6>(&db_path),
+
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
 }
@@ -149,6 +154,95 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     Move::from_string(&s).map_err(serde::de::Error::custom)
+}
+
+pub fn analyze_games_cataklysm<const S: usize>(db_name: &str) {
+    let mut games_conn = Connection::open(db_name).unwrap();
+    let mut all_games: Vec<PlaytakGame> = read_all_games::<S>(&mut games_conn)
+        .into_iter()
+        .filter(|game| game.komi.half_komi() == 0 || game.komi.half_komi() == 4)
+        .collect();
+    let stats = Stats::default();
+
+    println!("Found {} non-bot games", all_games.len());
+    let start_time = Instant::now();
+
+    all_games.into_par_iter()
+        .for_each_init(
+        || Connection::open(db_name).unwrap(),
+        |conn, game| {
+            let mut position: Position<S> = Position::start_position_with_komi(game.komi);
+            for mv in game.notation.split_whitespace() {
+                let mv = Move::from_string(mv).unwrap();
+                assert!(position.move_is_legal(mv));
+                position.do_move(mv);
+                if position.half_moves_played() < 6 {
+                    continue;
+                }
+
+                let mut stmt = conn
+                    .prepare("SELECT * FROM puzzles WHERE tps = ?1")
+                    .unwrap();
+                let mut rows = stmt.query([position.to_fen()]).unwrap();
+                if rows.next().unwrap().is_some() {
+                    // A topaz tinue has already been found, skip
+                    continue;
+                }
+
+                let (eval, pv) = cataklysm_search(position.clone(), 7, &stats);
+                if eval.is_decisive()
+                    && !eval.to_string().starts_with("loss")
+                    && pv.split_whitespace().count() > 1
+                {
+                    let topaz_result = topaz_search_one_move::<S>(&position.to_fen(), &stats);
+                    if topaz_result == Some(false) {
+                        let tiltak_start_time = Instant::now();
+                        let tiltak_result = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
+                        stats.tiltak_tinue.record(tiltak_start_time.elapsed());
+                        let tiltak_delta = tiltak_result.score_first - tiltak_result.score_second;
+                        if reserves_left_for_us(&position) > 4 || tiltak_delta > 0.1 {
+                            println!(
+                                "Found decisive non-tinue eval \"{}\", {} reserves left, pv {} at # {}",
+                                eval,
+                                reserves_left_for_us(&position),
+                                pv,
+                                game.id
+                            );
+                            println!(
+                                "Tiltak 1st: {:.3} {}, 2nd: {:.3} {}",
+                                tiltak_result.score_first,
+                                tiltak_result
+                                    .pv_first
+                                    .iter()
+                                    .take(3)
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                tiltak_result.score_second,
+                                tiltak_result
+                                    .pv_second
+                                    .iter()
+                                    .take(3)
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            );
+                            println!("{}", position.to_fen());
+                        }
+                    }
+                }
+            }
+            let n = NUM_GAMES_PROCESSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 100 == 0 {
+                println!(
+                    "Processed {} games in {:.1}s",
+                    n,
+                    start_time.elapsed().as_secs_f64()
+                );
+                println!("{}", stats);
+            }
+        },
+    )
 }
 
 pub fn analyze_puzzles_cataklysm<const S: usize>(db_name: &str) {
@@ -2180,6 +2274,7 @@ pub struct Stats {
     tiltak_non_tinue_short: TimeTracker,
     tiltak_non_tinue_long: TimeTracker,
     desperado_defenses: TimeTracker,
+    cataklysm: TimeTracker,
 }
 
 impl Display for Stats {
@@ -2198,6 +2293,8 @@ impl Display for Stats {
         self.tiltak_tinue.print_short();
         write!(f, "Desperado defenses: ")?;
         self.desperado_defenses.print_short();
+        write!(f, "Cataklysm: ")?;
+        self.cataklysm.print_full();
         writeln!(f)
     }
 }
@@ -2322,7 +2419,7 @@ fn tiltak_search<const S: usize>(position: Position<S>, nodes: u32) -> TiltakRes
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum TopazResult<const S: usize> {
     NoTinue,
     RoadWin,
@@ -2348,6 +2445,40 @@ fn topaz_search<const S: usize>(tps: &str, stats: &Stats) -> TopazResult<S> {
         6 => topaz_search_6s(tps, stats).downcast_size(),
         _ => unimplemented!(),
     }
+}
+
+/// Run Topaz tinue search on the position, without checking tinue for the followup
+/// Returns None on timeout, Some(false) if no tinue found
+pub fn topaz_search_one_move<const S: usize>(tps: &str, stats: &Stats) -> Option<bool> {
+    match S {
+        5 => topaz_search_one_move_5s(tps, stats),
+        6 => topaz_search_one_move_6s(tps, stats),
+        _ => unimplemented!(),
+    }
+}
+
+pub fn topaz_search_one_move_5s(tps: &str, stats: &Stats) -> Option<bool> {
+    let board = topaz_tak::board::Board5::try_from_tps(tps).unwrap();
+    let start_time = Instant::now();
+    let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
+        .quiet()
+        .limit(TOPAZ_FIRST_MOVE_NODES);
+    let result = first_tinue_search.is_tinue();
+    stats.topaz_tinue_first.record(start_time.elapsed());
+
+    result
+}
+
+pub fn topaz_search_one_move_6s(tps: &str, stats: &Stats) -> Option<bool> {
+    let board = topaz_tak::board::Board6::try_from_tps(tps).unwrap();
+    let start_time = Instant::now();
+    let mut first_tinue_search = topaz_tak::search::proof::TinueSearch::new(board.clone())
+        .quiet()
+        .limit(TOPAZ_FIRST_MOVE_NODES);
+    let result = first_tinue_search.is_tinue();
+    stats.topaz_tinue_first.record(start_time.elapsed());
+
+    result
 }
 
 fn topaz_search_5s(tps: &str, stats: &Stats) -> TopazResult<5> {
