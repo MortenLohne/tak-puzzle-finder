@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,8 +11,8 @@ use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
 use rayon::prelude::*;
 use rusqlite::Connection;
-use serde::Serialize;
-use serde_rusqlite::to_params_named;
+use serde::{Deserialize, Serialize};
+use serde_rusqlite::{from_row, to_params_named};
 use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
 
 use crate::{
@@ -66,6 +67,159 @@ fn insert_puzzle_candidate<const S: usize>(
                 );
             });
     }
+}
+
+pub fn evaluate_followups<const S: usize>(db_path: &str) {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT candidate_full_solutions.* FROM candidate_full_solutions
+            JOIN games ON candidate_full_solutions.game_id = games.id
+            WHERE games.size = ?1",
+        )
+        .unwrap();
+    let followups: Vec<TinueLineCandidateRow> = stmt
+        .query_and_then([S], from_row::<TinueLineCandidateRow>)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let followups_per_position: HashMap<String, Vec<TinueLineCandidateRow>> = followups
+        .into_iter()
+        .fold(HashMap::new(), |mut acc, followup| {
+            acc.entry(followup.tps.clone()).or_default().push(followup);
+            acc
+        });
+
+    let candidates: Vec<TinuePuzzleCandidate2<S>> = followups_per_position
+        .iter()
+        .map(|(tps, followups)| TinuePuzzleCandidate2 {
+            position: Position::from_fen(tps).unwrap(),
+            solutions: followups
+                .iter()
+                .map(|followup| TinueLineCandidate {
+                    moves: followup
+                        .solution
+                        .split_whitespace()
+                        .map(|s| Move::from_string(s).unwrap())
+                        .collect(),
+                    goes_to_road: followup.goes_to_road,
+                    pure_recaptures_end_sequence: followup
+                        .pure_recaptures_end_sequence
+                        .split_whitespace()
+                        .map(|s| Move::from_string(s).unwrap())
+                        .collect(),
+                    trivial_desperado_defense_skipped: followup
+                        .trivial_desperado_defense_skipped
+                        .as_ref()
+                        .map(|s| {
+                            s.split_whitespace()
+                                .map(|s| Move::from_string(s).unwrap())
+                                .collect()
+                        }),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let mut num_approved = 0;
+    let mut num_denied = 0;
+    let mut num_manual_review_single_solution = 0;
+    let mut num_manual_review_multi_solution = 0;
+    let mut num_manual_goes_to_road = 0;
+    let mut num_manual_no_road = 0;
+    for candidate in candidates.iter() {
+        let puzzle_evaluation = evaluate_puzzle_candidate(candidate.clone());
+
+        match puzzle_evaluation {
+            PuzzleCandidateEvaluation::Approve(_) => {
+                num_approved += 1;
+            }
+            PuzzleCandidateEvaluation::Deny => {
+                num_denied += 1;
+            }
+            PuzzleCandidateEvaluation::ManualReview(_) if candidate.solutions.len() == 1 => {
+                num_manual_review_single_solution += 1;
+            }
+            PuzzleCandidateEvaluation::ManualReview(_) => {
+                num_manual_review_multi_solution += 1;
+            }
+        }
+        if matches!(
+            puzzle_evaluation,
+            PuzzleCandidateEvaluation::ManualReview(_)
+        ) {
+            if candidate
+                .solutions
+                .iter()
+                .any(|s| s.goes_to_road || !s.pure_recaptures_end_sequence.is_empty())
+            {
+                num_manual_goes_to_road += 1;
+            } else {
+                num_manual_no_road += 1;
+            }
+        }
+        println!("Position: {}", candidate.position.to_fen());
+        for processed_candidate in candidate.solutions.iter() {
+            print!(
+                "Goes to road: {}, solution: {}",
+                processed_candidate.goes_to_road,
+                processed_candidate
+                    .moves
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            if processed_candidate.moves.len() % 2 == 0 {
+                print!(" *");
+            }
+            if !processed_candidate.pure_recaptures_end_sequence.is_empty() {
+                print!(
+                    " (desperado defense: {})",
+                    processed_candidate
+                        .pure_recaptures_end_sequence
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            if let Some(skipped_line) = &processed_candidate.trivial_desperado_defense_skipped {
+                print!(
+                    " (trivial desperado defense skipped: {})",
+                    skipped_line
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            if puzzle_evaluation == PuzzleCandidateEvaluation::Approve(processed_candidate.clone())
+            {
+                print!(" (approved solution)");
+            } else if puzzle_evaluation == PuzzleCandidateEvaluation::Deny {
+                print!(" (denied solution)");
+            } else if puzzle_evaluation
+                == PuzzleCandidateEvaluation::ManualReview(processed_candidate.clone())
+            {
+                print!(" (primary candidate solution)");
+            }
+            println!();
+        }
+        println!();
+    }
+
+    println!(
+        "Evaluated {} candidates: {} approved, {} denied, {} manual that goes to road or pure recapture sequence, {} manual that doesn't, {} manual review single solution, {} manual review multi solution",
+        candidates.len(),
+        num_approved,
+        num_denied,
+        num_manual_goes_to_road,
+        num_manual_no_road,
+        num_manual_review_single_solution,
+        num_manual_review_multi_solution
+    );
 }
 
 pub fn find_all<const S: usize>(
@@ -376,7 +530,7 @@ pub struct TinuePuzzleCandidate2<const S: usize> {
     pub solutions: Vec<TinueLineCandidate<S>>,
 }
 
-#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct TinueLineCandidateRow {
     pub game_id: u64,
     pub tps: String,

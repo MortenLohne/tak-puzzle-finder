@@ -68,6 +68,8 @@ enum CliCommands {
     AnalyzePuzzles,
     /// Analyze all games in the database with Cataklysm
     AnalyzeGames,
+    /// Manually evaluate followup tinue puzzles
+    EvaluateFollowupTinues,
 }
 
 #[derive(Args)]
@@ -125,6 +127,9 @@ fn main() {
 
         (CliCommands::AnalyzeGames, 5) => analyze_games_cataklysm::<5>(&db_path),
         (CliCommands::AnalyzeGames, 6) => analyze_games_cataklysm::<6>(&db_path),
+
+        (CliCommands::EvaluateFollowupTinues, 5) => followups::evaluate_followups::<5>(&db_path),
+        (CliCommands::EvaluateFollowupTinues, 6) => followups::evaluate_followups::<6>(&db_path),
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }
