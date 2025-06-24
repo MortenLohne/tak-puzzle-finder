@@ -467,7 +467,7 @@ fn find_last_defending_move_among_moves<const S: usize>(
             let mut score = 0;
             // If they're about to win on flats, strongly prefer the highest FCD move
             if their_reserves_left == 1 {
-                let fcd = position.fcd_for_move(**mv);
+                let fcd = position.fcd_for_move(**mv).max(0);
                 score += 12 * fcd;
             }
             if matches!(mv.expand(), ExpMove::Place(Role::Wall, _)) {

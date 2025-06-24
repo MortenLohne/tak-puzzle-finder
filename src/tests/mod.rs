@@ -94,14 +94,12 @@ fn find_full_tinue_prop<const S: usize>(
     solution: &str,
     possible_solution: &[&'static str],
 ) {
-    let mut position: Position<S> = Position::from_fen(tps).unwrap();
+    let position: Position<S> = Position::from_fen(tps).unwrap();
     let mv = Move::from_string(solution).unwrap();
-    assert!(position.move_is_legal(mv), "Move is not legal in position");
-    position.do_move(mv);
 
     let stats = Stats::default();
 
-    let candidate_tinue = extract_possible_full_tinues(position, &stats);
+    let candidate_tinue = extract_possible_full_tinues(position, mv, &stats);
 
     let possible_solution: Vec<Move<S>> = possible_solution
         .into_iter()

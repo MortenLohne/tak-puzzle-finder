@@ -122,6 +122,14 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
         })
         .collect();
 
+    println!("Reanalyzing {} candidates", candidates.len());
+    // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
+    let candidates = candidates
+        .into_par_iter()
+        .map(|candidate| candidate.reanalyze())
+        .collect::<Vec<_>>();
+    println!("Reanalyzed {} candidates", candidates.len());
+
     let mut num_approved = 0;
     let mut num_denied = 0;
     let mut num_manual_review_single_solution = 0;
@@ -268,11 +276,12 @@ pub fn find_all<const S: usize>(
         .par_iter()
         .map_init(||Connection::open(db_path).unwrap(), |conn, puzzle_root| {
             let mut position = Position::from_fen(&puzzle_root.tps).unwrap();
+            let root_position = position.clone();
             let mv = puzzle_root.solution;
             assert!(position.move_is_legal(mv));
             position.do_move(mv);
 
-            let tinue_candidate = extract_possible_full_tinues(position.clone(), &stats);
+            let tinue_candidate = extract_possible_full_tinues(root_position, mv, &stats);
             let desperado_followup_start_time = Instant::now();
             let processed_candidate = process_full_tinue(tinue_candidate.clone());
             stats
@@ -287,7 +296,7 @@ pub fn find_all<const S: usize>(
                 .map(|(tinue, goes_to_road)| {
                     if !goes_to_road {
                         let mut position_clone = position.clone();
-                        for mv in tinue.iter().skip(1) {
+                        for mv in tinue.iter() {
                             assert!(position_clone.move_is_legal(*mv));
                             position_clone.do_move(*mv);
                         }
@@ -524,10 +533,29 @@ pub struct TinuePuzzleCandidate<const S: usize> {
     pub solutions: Vec<(Vec<Move<S>>, bool)>,
 }
 
+impl<const S: usize> From<TinuePuzzleCandidate2<S>> for TinuePuzzleCandidate<S> {
+    fn from(candidate: TinuePuzzleCandidate2<S>) -> Self {
+        TinuePuzzleCandidate {
+            position: candidate.position,
+            solutions: candidate
+                .solutions
+                .into_iter()
+                .map(|solution| (solution.moves, solution.goes_to_road))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TinuePuzzleCandidate2<const S: usize> {
     pub position: Position<S>,
     pub solutions: Vec<TinueLineCandidate<S>>,
+}
+
+impl<const S: usize> TinuePuzzleCandidate2<S> {
+    pub fn reanalyze(self) -> Self {
+        process_full_tinue(TinuePuzzleCandidate::from(self))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -656,6 +684,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
     defender_moves.retain(
         // Only keep defending moves that don't lead to an immediate win
         |mv| {
+            assert!(position.move_is_legal(*mv));
             let reverse_move = position.do_move(*mv);
             let mut child_moves = vec![];
             position.generate_moves(&mut child_moves);
@@ -796,9 +825,20 @@ pub fn process_full_tinue<const S: usize>(
         .solutions
         .into_iter()
         .map(|(mut solution, goes_to_road)| {
-            let mut position = puzzle.position.clone();
-            for mv in solution.iter().skip(1) {
-                assert!(position.move_is_legal(*mv));
+            let mut position: Position<S> = puzzle.position.clone();
+            for mv in solution.iter() {
+                assert!(
+                    position.move_is_legal(*mv),
+                    "Move {} is not legal in position {}, root position {}, solution {}",
+                    mv,
+                    position.to_fen(),
+                    puzzle.position.to_fen(),
+                    solution
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
                 position.do_move(*mv);
             }
             if goes_to_road {
@@ -877,9 +917,12 @@ pub fn process_full_tinue<const S: usize>(
 
 pub fn extract_possible_full_tinues<const S: usize>(
     mut position: Position<S>,
+    first_move: Move<S>,
     stats: &Stats,
 ) -> TinuePuzzleCandidate<S> {
-    let mut moves = vec![position.moves().last().expect("No last move found").clone()];
+    assert!(position.move_is_legal(first_move));
+    position.do_move(first_move);
+    let mut moves = vec![first_move];
     let mut possible_lines = vec![];
 
     find_followup_recursive(&mut position, &mut moves, &stats, &mut possible_lines);
