@@ -64,9 +64,9 @@ enum CliCommands {
     ExportPuzzles(ExportPuzzlesArgs),
     FindFollowupsNew,
     FindGaelets,
-    /// Analyze puzzles already in the database with Cataklysm
+    /// Analyze puzzles already in the database with Cataklysm, and interactively (i.e. manually) add them to the database
     AnalyzePuzzles,
-    /// Anazlyze all games in the database with Cataklysm
+    /// Analyze all games in the database with Cataklysm
     AnalyzeGames,
 }
 
@@ -158,7 +158,7 @@ where
 
 pub fn analyze_games_cataklysm<const S: usize>(db_name: &str) {
     let mut games_conn = Connection::open(db_name).unwrap();
-    let mut all_games: Vec<PlaytakGame> = read_all_games::<S>(&mut games_conn)
+    let all_games: Vec<PlaytakGame> = read_all_games::<S>(&mut games_conn)
         .into_iter()
         .filter(|game| game.komi.half_komi() == 0 || game.komi.half_komi() == 4)
         .collect();
@@ -449,11 +449,21 @@ fn find_last_defending_move_among_moves<const S: usize>(
         return None;
     }
 
+    let their_reserves_left = match !position.side_to_move() {
+        Color::White => position.white_reserves_left() + position.white_caps_left(),
+        Color::Black => position.black_reserves_left() + position.black_caps_left(),
+    };
+
     let (best_move, _, winning_response) = results
         .into_iter()
         .filter(|(_, num_winning_moves, _)| *num_winning_moves == lowest_winning_moves)
         .max_by_key(|(mv, _, _)| {
             let mut score = 0;
+            // If they're about to win on flats, strongly prefer the highest FCD move
+            if their_reserves_left == 1 {
+                let fcd = position.fcd_for_move(**mv);
+                score += 12 * fcd;
+            }
             if matches!(mv.expand(), ExpMove::Place(Role::Wall, _)) {
                 score += 10; // Prefer wall placements
             }
@@ -1973,37 +1983,6 @@ fn read_all_games<const S: usize>(conn: &Connection) -> Vec<PlaytakGame> {
         }
     })
     .collect()
-}
-
-fn read_potential_gaelets<const S: usize>(conn: &Connection) -> Vec<PlaytakGame> {
-    let mut stmt = conn.prepare("SELECT puzzles.* from puzzles JOIN games on puzzles.game_id = games.id 
-	WHERE games.size = ?1 AND games.komi = 0 AND tinue_length IS NULL AND tinue_avoidance_length IS NULL AND tiltak_0komi_eval > 0.9 AND tiltak_0komi_second_move_eval < 0.6
-	ORDER BY tiltak_0komi_eval - tiltak_0komi_second_move_eval DESC")
-    .unwrap();
-    let rows = stmt.query([S]).unwrap().mapped(|row| {
-        Ok(GameRow {
-            id: row.get(0).unwrap(),
-            date: row.get(1).unwrap(),
-            size: row.get(2).unwrap(),
-            player_white: row.get(3).unwrap(),
-            player_black: row.get(4).unwrap(),
-            notation: row.get(5).unwrap(),
-            result: row.get(6).unwrap(),
-            timertime: Duration::from_secs(row.get(7).unwrap()),
-            timerinc: Duration::from_secs(row.get(8).unwrap()),
-            rating_white: row.get(9).unwrap(),
-            rating_black: row.get(10).unwrap(),
-            unrated: row.get(11).unwrap(),
-            tournament: row.get(12).unwrap(),
-            komi: row.get(13).unwrap(),
-            pieces: position::starting_stones(row.get(2).unwrap()) as i64,
-            capstones: position::starting_capstones(row.get(2).unwrap()) as i64,
-        })
-    });
-
-    rows.map(|row| PlaytakGame::try_from(row.unwrap()).ok())
-        .collect::<Option<Vec<_>>>()
-        .unwrap()
 }
 
 fn read_non_bot_games(conn: &mut Connection) -> Option<Vec<PlaytakGame>> {
