@@ -52,7 +52,7 @@ pub fn find_potential_gaelet<const S: usize>(db_path: &str) {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare("SELECT games.id AS playtak_game_id, games.komi AS half_komi, puzzles.* FROM puzzles JOIN games ON puzzles.game_id = games.id
-            WHERE games.size = ?1 AND tinue_length IS NULL AND tinue_avoidance_length IS NULL AND (games.komi = 0 AND tiltak_0komi_eval > 0.8 AND tiltak_0komi_eval - tiltak_0komi_second_move_eval > 0.3 OR games.komi = 4 AND tiltak_2komi_eval > 0.8 AND tiltak_2komi_eval - tiltak_2komi_second_move_eval > 0.3)")
+            WHERE games.size = ?1 AND puzzles.gaelet_followups_analyzed = 0 AND tinue_length IS NULL AND tinue_avoidance_length IS NULL AND (games.komi = 0 AND tiltak_0komi_eval > 0.8 AND tiltak_0komi_eval - tiltak_0komi_second_move_eval > 0.3 OR games.komi = 4 AND tiltak_2komi_eval > 0.8 AND tiltak_2komi_eval - tiltak_2komi_second_move_eval > 0.3)")
         .unwrap();
 
     let gaelet_roots: Vec<GaeletRoot<S>> = from_rows::<GaeletRoot<S>>(stmt.query([S]).unwrap())
@@ -91,16 +91,20 @@ pub fn find_potential_gaelet<const S: usize>(db_path: &str) {
     let manual_eval_mutex = Mutex::new(());
 
     endgame_gaelet_roots.into_par_iter().for_each_init(|| Connection::open(db_path).unwrap(), |conn, root| {
+        let mut update_stmt = conn
+            .prepare("UPDATE puzzles SET gaelet_followups_analyzed = 1 WHERE tps = ?1")
+            .unwrap();
+
         let komi = Komi::from_half_komi(root.half_komi).unwrap();
         let mut position = Position::<S>::from_fen_with_komi(&root.tps, komi).unwrap();
-        let (eval, pv) = cataklysm_search(position.clone(), 11, &stats);
+        let (eval, pv) = cataklysm_search(position.clone(), 11, &stats, 1 << 20);
         if eval.is_decisive() {
             let solution = Move::from_string(pv.split_whitespace().next().unwrap()).unwrap();
             assert!(position.move_is_legal(solution));
             let tiltak_eval = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
             position.do_move(solution);
             if position.game_result().is_some() {
-                // Skip positions that are already terminal
+                update_stmt.execute([root.tps]).unwrap();
                 return;
             }
             let moves = vec![(solution, Some((eval, tiltak_eval)))];
@@ -213,6 +217,7 @@ pub fn find_potential_gaelet<const S: usize>(db_path: &str) {
             );
             println!();
         }
+        update_stmt.execute([root.tps]).unwrap();
     });
 }
 
@@ -229,7 +234,7 @@ pub fn find_gaelet_followup<const S: usize>(
         if let Some(winning_move) = winning_move {
             let reverse_move = position.do_move(defender_move);
             let tiltak_eval = tiltak_search(position.clone(), TILTAK_DEEP_NODES);
-            let (child_eval, _) = cataklysm_search(position.clone(), 3, &Stats::default());
+            let (child_eval, _) = cataklysm_search(position.clone(), 3, &Stats::default(), 1 << 20);
 
             new_solution.push((winning_move, Some((child_eval, tiltak_eval.clone()))));
 
@@ -252,7 +257,9 @@ pub fn find_gaelet_followup<const S: usize>(
         if tiltak_delta > 0.1 || tiltak_eval.score_first < 0.9 {
             let mut new_solution = moves.to_vec();
             new_solution.push((defender_move, None));
-            let (child_eval, _) = cataklysm_search(position.clone(), 11, &Stats::default());
+            // Search with a 1024 MiB transposition table
+            let (child_eval, _) =
+                cataklysm_search(position.clone(), 11, &Stats::default(), 1 << 25);
             new_solution.push((
                 tiltak_eval.pv_first[0],
                 Some((child_eval, tiltak_eval.clone())),
@@ -308,13 +315,14 @@ pub fn cataklysm_search<const S: usize>(
     position: Position<S>,
     max_depth: u32,
     stats: &Stats,
+    tt_size: usize, // Number of buckets in the transposition table. Each bucket is 32 bytes.
 ) -> (Eval, String) {
     let mut options: Options = Options {
         half_komi: position.komi().half_komi() as i32,
         ..Options::default(S).unwrap()
     };
 
-    options.params.tt_size = 1 << 20; // Set the transposition table size to 32 MiB
+    options.params.tt_size = tt_size; // Set the transposition table size to 32 MiB
 
     let mut game = new_game(S, options).unwrap();
     game.set_position(&position.to_fen()).unwrap();
@@ -339,7 +347,8 @@ pub fn cataklysm_search_root<const S: usize>(
 ) -> (Eval, String) {
     let start_time = Instant::now();
 
-    let (eval, pv) = cataklysm_search(position.clone(), max_depth, stats);
+    // Search with a 32 MiB tt
+    let (eval, pv) = cataklysm_search(position.clone(), max_depth, stats, 1 << 20);
 
     println!(
         "#{}: Komi: {}, tps: {}",

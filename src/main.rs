@@ -190,7 +190,8 @@ pub fn analyze_games_cataklysm<const S: usize>(db_name: &str) {
                     continue;
                 }
 
-                let (eval, pv) = cataklysm_search(position.clone(), 7, &stats);
+                // Search with 64 MiB tt
+                let (eval, pv) = cataklysm_search(position.clone(), 7, &stats, 1 << 21);
                 if eval.is_decisive()
                     && !eval.to_string().starts_with("loss")
                     && pv.split_whitespace().count() > 1
@@ -1713,6 +1714,7 @@ fn main_sized<const S: usize>(playtak_db_name: &Option<String>, db_path: &str) {
             tiltak_0komi_second_pv_length INTEGER NOT NULL,
             tiltak_2komi_second_pv_length INTEGER NOT NULL,
             followups_analyzed INT DEFAULT 0,
+            gaelet_followups_analyzed INT NOT NULL DEFAULT 0,
             FOREIGN KEY(game_id) REFERENCES games(id)
             )",
             [],
@@ -1862,7 +1864,7 @@ fn store_topaz_missed_tinues(conn: &mut Connection, game_id: u32, tps: &str) {
 }
 
 fn store_puzzle(puzzles_pool: &mut Connection, puzzle: Puzzle) {
-    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles VALUES (:game_id, :tps, :solution, :tiltak_0komi_eval, :tiltak_2komi_eval, :tiltak_0komi_second_move_eval, :tiltak_2komi_second_move_eval, :tinue_length, :tinue_avoidance_length, :tiltak_0komi_pv_length, :tiltak_2komi_pv_length, :tiltak_0komi_second_pv_length, :tiltak_2komi_second_pv_length, 0)", to_params_named(&puzzle).unwrap().to_slice().as_slice()) {
+    while let Err(rusqlite::Error::SqliteFailure(err, _)) = puzzles_pool.execute("INSERT OR IGNORE INTO puzzles VALUES (:game_id, :tps, :solution, :tiltak_0komi_eval, :tiltak_2komi_eval, :tiltak_0komi_second_move_eval, :tiltak_2komi_second_move_eval, :tinue_length, :tinue_avoidance_length, :tiltak_0komi_pv_length, :tiltak_2komi_pv_length, :tiltak_0komi_second_pv_length, :tiltak_2komi_second_pv_length, 0, 0)", to_params_named(&puzzle).unwrap().to_slice().as_slice()) {
         println!(
             "Failed to insert \"{}\" from game ${} into DB. Retrying in 1s: {}",
             puzzle.tps, puzzle.game_id, err
