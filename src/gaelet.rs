@@ -322,7 +322,7 @@ pub fn cataklysm_search<const S: usize>(
         ..Options::default(S).unwrap()
     };
 
-    options.params.tt_size = tt_size; // Set the transposition table size to 32 MiB
+    options.params.tt_size = tt_size;
 
     let mut game = new_game(S, options).unwrap();
     game.set_position(&position.to_fen()).unwrap();

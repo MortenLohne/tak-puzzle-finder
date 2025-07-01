@@ -99,7 +99,7 @@ fn find_full_tinue_prop<const S: usize>(
 
     let stats = Stats::default();
 
-    let candidate_tinue = extract_possible_full_tinues(position, mv, &stats);
+    let candidate_tinue = extract_possible_full_tinues(position, mv, 3, &stats);
 
     let possible_solution: Vec<Move<S>> = possible_solution
         .into_iter()
@@ -314,6 +314,7 @@ fn review_long_non_road_candidates() {
     let candidate = TinuePuzzleCandidate2 {
         position: Position::start_position(), // Position doesn't matter
         solutions: solutions.clone(),
+        root_topaz_tinue_length: 3, // Value doesn't matter for this test
     };
 
     let evaluation = evaluate_puzzle_candidate(candidate.clone());
@@ -347,6 +348,7 @@ fn prefer_puzzle_candidates_with_walls() {
     let candidate = TinuePuzzleCandidate2 {
         position: Position::start_position(), // Position doesn't matter
         solutions,
+        root_topaz_tinue_length: 3, // Value doesn't matter for this test
     };
 
     let evaluation = evaluate_puzzle_candidate(candidate.clone());

@@ -17,7 +17,8 @@ use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
 
 use crate::{
     NUM_GAMES_PROCESSED, PuzzleF, PuzzleRoot, Stats, TILTAK_DEEP_NODES, TinueFollowup, TopazResult,
-    find_last_defending_move, find_last_defending_move_among_moves, tiltak_search, topaz_search,
+    find_last_defending_move, find_last_defending_move_among_moves, gaelet::cataklysm_search,
+    tiltak_search, topaz_search,
 };
 
 pub fn find_all_from_db<const S: usize>(db_path: &str) {
@@ -73,8 +74,9 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT candidate_full_solutions.* FROM candidate_full_solutions
+            "SELECT candidate_full_solutions.*, puzzles.tinue_length AS root_topaz_tinue_length FROM candidate_full_solutions
             JOIN games ON candidate_full_solutions.game_id = games.id
+            JOIN puzzles ON candidate_full_solutions.tps = puzzles.tps
             WHERE games.size = ?1",
         )
         .unwrap();
@@ -119,10 +121,11 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
                         }),
                 })
                 .collect(),
+            root_topaz_tinue_length: followups[0].root_topaz_tinue_length,
         })
         .collect();
 
-    print_candidate_stats(&candidates);
+    // print_candidate_stats(&candidates);
     println!("Reanalyzing {} candidates", candidates.len());
     // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
     let candidates = candidates
@@ -138,6 +141,7 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
     let mut num_approved = 0;
     let mut num_denied = 0;
     let mut num_manual_review_single_solution = 0;
+    let mut num_manual_review_single_solution_with_desperado = 0;
     let mut num_manual_review_multi_solution = 0;
     let mut num_manual_goes_to_road = 0;
     let mut num_manual_no_road = 0;
@@ -153,6 +157,12 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
             }
             PuzzleCandidateEvaluation::ManualReview(_) if candidate.solutions.len() == 1 => {
                 num_manual_review_single_solution += 1;
+                if !candidate.solutions[0]
+                    .pure_recaptures_end_sequence
+                    .is_empty()
+                {
+                    num_manual_review_single_solution_with_desperado += 1;
+                }
             }
             PuzzleCandidateEvaluation::ManualReview(_) => {
                 num_manual_review_multi_solution += 1;
@@ -173,6 +183,7 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
             }
         }
         println!("Position: {}", candidate.position.to_fen());
+        println!("Topaz tinue length: {}", candidate.root_topaz_tinue_length);
         for processed_candidate in candidate.solutions.iter() {
             print!(
                 "Goes to road: {}, solution: {}",
@@ -208,6 +219,18 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
                         .join(" ")
                 );
             }
+            if !processed_candidate.goes_to_road
+                && puzzle_evaluation != PuzzleCandidateEvaluation::Deny
+            {
+                let mut position = candidate.position.clone();
+                for mv in processed_candidate.moves.iter() {
+                    assert!(position.move_is_legal(*mv));
+                    position.do_move(*mv);
+                }
+                let (cataklysm_eval, cataklysm_pv) =
+                    cataklysm_search(position, 6, &Stats::default(), 1 << 18);
+                print!(" (Cataklysm: {}, {})", cataklysm_eval, cataklysm_pv);
+            }
             if puzzle_evaluation == PuzzleCandidateEvaluation::Approve(processed_candidate.clone())
             {
                 print!(" (approved solution)");
@@ -224,13 +247,15 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
     }
 
     println!(
-        "Evaluated {} candidates: {} approved, {} denied, {} manual that goes to road or pure recapture sequence, {} manual that doesn't, {} manual review single solution, {} manual review multi solution",
+        "Evaluated {} candidates: {} approved, {} denied, {} total manual, {} manual that goes to road or pure recapture sequence, {} manual that doesn't, {} manual review single solution, {} manual review single solution with desperado, {} manual review multi solution",
         candidates.len(),
         num_approved,
         num_denied,
+        num_manual_review_single_solution + num_manual_review_multi_solution,
         num_manual_goes_to_road,
         num_manual_no_road,
         num_manual_review_single_solution,
+        num_manual_review_single_solution_with_desperado,
         num_manual_review_multi_solution
     );
 }
@@ -286,7 +311,7 @@ pub fn find_all<const S: usize>(
             assert!(position.move_is_legal(mv));
             position.do_move(mv);
 
-            let tinue_candidate = extract_possible_full_tinues(root_position, mv, &stats);
+            let tinue_candidate = extract_possible_full_tinues(root_position, mv, puzzle_root.tinue_length, &stats);
             let desperado_followup_start_time = Instant::now();
             let processed_candidate = process_full_tinue(tinue_candidate.clone());
             stats
@@ -437,6 +462,7 @@ pub enum PuzzleCandidateEvaluation<const S: usize> {
 
 pub fn evaluate_candidate_line<const S: usize>(
     solution: TinueLineCandidate<S>,
+    root_topaz_tinue_length: usize,
 ) -> PuzzleCandidateEvaluation<S> {
     use PuzzleCandidateEvaluation::*;
 
@@ -453,6 +479,9 @@ pub fn evaluate_candidate_line<const S: usize>(
     } else if !solution.pure_recaptures_end_sequence.is_empty() {
         // Longer puzzles that end in a clear tinue are good candidates
         Approve(solution)
+    } else if solution.moves.len() * 3 < root_topaz_tinue_length {
+        // Deny puzzles where the solution line is much shorter than topaz' root length
+        Deny
     } else {
         ManualReview(solution)
     }
@@ -463,7 +492,10 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
 ) -> PuzzleCandidateEvaluation<S> {
     use PuzzleCandidateEvaluation::*;
     if candidate.solutions.len() == 1 {
-        return evaluate_candidate_line(candidate.solutions[0].clone());
+        return evaluate_candidate_line(
+            candidate.solutions[0].clone(),
+            candidate.root_topaz_tinue_length,
+        );
     }
     let any_solution_goes_to_road = candidate
         .solutions
@@ -527,7 +559,17 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
             solution == longest_solution || solution.num_moves() < longest_solution.num_moves()
         })
     {
-        return evaluate_candidate_line(longest_solution.clone());
+        return evaluate_candidate_line(
+            longest_solution.clone(),
+            candidate.root_topaz_tinue_length,
+        );
+    }
+    if candidate.solutions.iter().all(|solution| {
+        evaluate_candidate_line(solution.clone(), candidate.root_topaz_tinue_length)
+            == PuzzleCandidateEvaluation::Deny
+    }) {
+        // If all individual solutions would be denied, deny the whole puzzle
+        return Deny;
     }
     ManualReview(longest_solution.clone())
 }
@@ -536,6 +578,7 @@ pub fn evaluate_puzzle_candidate<const S: usize>(
 pub struct TinuePuzzleCandidate<const S: usize> {
     pub position: Position<S>,
     pub solutions: Vec<(Vec<Move<S>>, bool)>,
+    pub root_topaz_tinue_length: usize,
 }
 
 impl<const S: usize> From<TinuePuzzleCandidate2<S>> for TinuePuzzleCandidate<S> {
@@ -547,6 +590,7 @@ impl<const S: usize> From<TinuePuzzleCandidate2<S>> for TinuePuzzleCandidate<S> 
                 .into_iter()
                 .map(|solution| (solution.moves, solution.goes_to_road))
                 .collect(),
+            root_topaz_tinue_length: candidate.root_topaz_tinue_length,
         }
     }
 }
@@ -554,6 +598,7 @@ impl<const S: usize> From<TinuePuzzleCandidate2<S>> for TinuePuzzleCandidate<S> 
 #[derive(Clone)]
 pub struct TinuePuzzleCandidate2<const S: usize> {
     pub position: Position<S>,
+    pub root_topaz_tinue_length: usize,
     pub solutions: Vec<TinueLineCandidate<S>>,
 }
 
@@ -571,6 +616,7 @@ pub struct TinueLineCandidateRow {
     pub goes_to_road: bool,
     pub pure_recaptures_end_sequence: String,
     pub trivial_desperado_defense_skipped: Option<String>,
+    pub root_topaz_tinue_length: usize,
 }
 
 impl TinueLineCandidateRow {
@@ -607,6 +653,7 @@ impl TinueLineCandidateRow {
                             .collect::<Vec<_>>()
                             .join(" ")
                     }),
+                root_topaz_tinue_length: candidate.root_topaz_tinue_length,
             })
             .collect()
     }
@@ -917,12 +964,14 @@ pub fn process_full_tinue<const S: usize>(
     TinuePuzzleCandidate2 {
         position: puzzle.position,
         solutions: processed_candidates,
+        root_topaz_tinue_length: puzzle.root_topaz_tinue_length,
     }
 }
 
 pub fn extract_possible_full_tinues<const S: usize>(
     mut position: Position<S>,
     first_move: Move<S>,
+    topaz_root_tinue_length: usize,
     stats: &Stats,
 ) -> TinuePuzzleCandidate<S> {
     assert!(position.move_is_legal(first_move));
@@ -935,6 +984,7 @@ pub fn extract_possible_full_tinues<const S: usize>(
     let tinue = TinuePuzzleCandidate {
         position: position.clone(),
         solutions: possible_lines.clone(),
+        root_topaz_tinue_length: topaz_root_tinue_length,
     };
     tinue
 }
