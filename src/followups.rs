@@ -122,6 +122,7 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
         })
         .collect();
 
+    print_candidate_stats(&candidates);
     println!("Reanalyzing {} candidates", candidates.len());
     // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
     let candidates = candidates
@@ -130,6 +131,10 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
         .collect::<Vec<_>>();
     println!("Reanalyzed {} candidates", candidates.len());
 
+    print_candidate_stats(&candidates);
+}
+
+pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2<S>]) {
     let mut num_approved = 0;
     let mut num_denied = 0;
     let mut num_manual_review_single_solution = 0;
