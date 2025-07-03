@@ -119,6 +119,8 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
                                 .map(|s| Move::from_string(s).unwrap())
                                 .collect()
                         }),
+                    cataklysm_end_position_is_win: followup.cataklysm_end_position_is_win,
+                    cataklysm_end_position_pv: followup.cataklysm_end_position_pv.clone(),
                 })
                 .collect(),
             root_topaz_tinue_length: followups[0].root_topaz_tinue_length,
@@ -130,7 +132,7 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
     // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
     let candidates = candidates
         .into_par_iter()
-        .map(|candidate| candidate.reanalyze())
+        .map(|candidate| candidate.reanalyze(&Stats::default()))
         .collect::<Vec<_>>();
     println!("Reanalyzed {} candidates", candidates.len());
 
@@ -276,6 +278,8 @@ pub fn find_all<const S: usize>(
             goes_to_road BOOLEAN NOT NULL,
             pure_recaptures_end_sequence TEXT NOT NULL,
             trivial_desperado_defense_skipped TEXT,
+            cataklysm_end_position_is_win INTEGER,
+            cataklysm_end_position_pv TEXT,
             FOREIGN KEY (tps) REFERENCES puzzles(tps)
         )",
         [],
@@ -313,7 +317,7 @@ pub fn find_all<const S: usize>(
 
             let tinue_candidate = extract_possible_full_tinues(root_position, mv, puzzle_root.tinue_length, &stats);
             let desperado_followup_start_time = Instant::now();
-            let processed_candidate = process_full_tinue(tinue_candidate.clone());
+            let processed_candidate = process_full_tinue(tinue_candidate.clone(), &stats);
             stats
                 .desperado_defenses
                 .record(desperado_followup_start_time.elapsed());
@@ -603,8 +607,8 @@ pub struct TinuePuzzleCandidate2<const S: usize> {
 }
 
 impl<const S: usize> TinuePuzzleCandidate2<S> {
-    pub fn reanalyze(self) -> Self {
-        process_full_tinue(TinuePuzzleCandidate::from(self))
+    pub fn reanalyze(self, stats: &Stats) -> Self {
+        process_full_tinue(TinuePuzzleCandidate::from(self), stats)
     }
 }
 
@@ -617,6 +621,8 @@ pub struct TinueLineCandidateRow {
     pub pure_recaptures_end_sequence: String,
     pub trivial_desperado_defense_skipped: Option<String>,
     pub root_topaz_tinue_length: usize,
+    pub cataklysm_end_position_is_win: Option<bool>,
+    pub cataklysm_end_position_pv: Option<String>,
 }
 
 impl TinueLineCandidateRow {
@@ -654,6 +660,8 @@ impl TinueLineCandidateRow {
                             .join(" ")
                     }),
                 root_topaz_tinue_length: candidate.root_topaz_tinue_length,
+                cataklysm_end_position_is_win: solution.cataklysm_end_position_is_win,
+                cataklysm_end_position_pv: solution.cataklysm_end_position_pv,
             })
             .collect()
     }
@@ -673,6 +681,8 @@ pub struct TinueLineCandidate<const S: usize> {
     // and also refuted by other moves as well, so that the puzzle could not be extended to a road with that move
     // Because of this, the last defending move has been replaced by an immediately losing move
     pub trivial_desperado_defense_skipped: Option<Vec<Move<S>>>,
+    pub cataklysm_end_position_is_win: Option<bool>,
+    pub cataklysm_end_position_pv: Option<String>,
 }
 
 impl<const S: usize> TinueLineCandidate<S> {
@@ -872,6 +882,7 @@ pub fn find_desperado_defense_lines<const S: usize>(
 
 pub fn process_full_tinue<const S: usize>(
     puzzle: TinuePuzzleCandidate<S>,
+    stats: &Stats,
 ) -> TinuePuzzleCandidate2<S> {
     let processed_candidates: Vec<_> = puzzle
         .solutions
@@ -899,16 +910,21 @@ pub fn process_full_tinue<const S: usize>(
                     goes_to_road: true,
                     pure_recaptures_end_sequence: vec![],
                     trivial_desperado_defense_skipped: None,
+                    cataklysm_end_position_is_win: None,
+                    cataklysm_end_position_pv: None,
                 };
             }
             if let Some(desperado_result) = find_desperado_defense_lines(&mut position) {
                 if !desperado_result.only_trivial_recaptures {
+                    let (eval, pv) = cataklysm_search(position, 10, stats, 1 << 18);
                     // If the defense is not super trivial, don't skip it
                     TinueLineCandidate {
                         moves: solution.clone(),
                         goes_to_road: false,
                         pure_recaptures_end_sequence: desperado_result.moves,
                         trivial_desperado_defense_skipped: None,
+                        cataklysm_end_position_is_win: Some(eval.is_decisive()),
+                        cataklysm_end_position_pv: Some(pv),
                     }
                 } else {
                     // If the defense is trivial, generate a new immediate losing move at the end
@@ -949,14 +965,19 @@ pub fn process_full_tinue<const S: usize>(
                         goes_to_road: true,
                         pure_recaptures_end_sequence: vec![],
                         trivial_desperado_defense_skipped: Some(desperado_result.moves),
+                        cataklysm_end_position_is_win: None,
+                        cataklysm_end_position_pv: None,
                     }
                 }
             } else {
+                let (eval, pv) = cataklysm_search(position, 10, stats, 1 << 20);
                 TinueLineCandidate {
                     moves: solution.clone(),
                     goes_to_road: false,
                     pure_recaptures_end_sequence: vec![],
                     trivial_desperado_defense_skipped: None,
+                    cataklysm_end_position_is_win: Some(eval.is_decisive()),
+                    cataklysm_end_position_pv: Some(pv),
                 }
             }
         })

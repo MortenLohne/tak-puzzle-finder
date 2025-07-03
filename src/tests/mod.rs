@@ -299,6 +299,8 @@ fn review_long_non_road_candidates() {
         goes_to_road: false,
         pure_recaptures_end_sequence: vec![],
         trivial_desperado_defense_skipped: None,
+        cataklysm_end_position_is_win: None,
+        cataklysm_end_position_pv: None,
     })
     .collect();
     solutions.push(TinueLineCandidate {
@@ -309,6 +311,8 @@ fn review_long_non_road_candidates() {
         goes_to_road: true,
         pure_recaptures_end_sequence: vec![],
         trivial_desperado_defense_skipped: None,
+        cataklysm_end_position_is_win: None,
+        cataklysm_end_position_pv: None,
     });
 
     let candidate = TinuePuzzleCandidate2 {
@@ -343,6 +347,8 @@ fn prefer_puzzle_candidates_with_walls() {
         goes_to_road: true,
         pure_recaptures_end_sequence: vec![],
         trivial_desperado_defense_skipped: None,
+        cataklysm_end_position_is_win: None,
+        cataklysm_end_position_pv: None,
     })
     .collect();
     let candidate = TinuePuzzleCandidate2 {
