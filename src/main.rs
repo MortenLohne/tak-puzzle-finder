@@ -70,6 +70,8 @@ enum CliCommands {
     AnalyzeGames,
     /// Manually evaluate followup tinue puzzles
     EvaluateFollowupTinues,
+    /// One-off command to retroactively backfill Cataklysm evaluations for candidate solutions for tinue puzzles
+    BackfillCataklysmEval,
 }
 
 #[derive(Args)]
@@ -130,6 +132,13 @@ fn main() {
 
         (CliCommands::EvaluateFollowupTinues, 5) => followups::evaluate_followups::<5>(&db_path),
         (CliCommands::EvaluateFollowupTinues, 6) => followups::evaluate_followups::<6>(&db_path),
+
+        (CliCommands::BackfillCataklysmEval, 5) => {
+            followups::backfill_cataklysm_evals::<5>(&db_path)
+        }
+        (CliCommands::BackfillCataklysmEval, 6) => {
+            followups::backfill_cataklysm_evals::<6>(&db_path)
+        }
 
         (_, s @ 7..) | (_, s @ 0..5) => panic!("Unsupported size: {}", s),
     }

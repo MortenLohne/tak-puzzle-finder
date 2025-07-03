@@ -10,7 +10,7 @@ use std::{
 use board_game_traits::{GameResult, Position as PositionTrait};
 use pgn_traits::PgnPosition;
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_rusqlite::{from_row, to_params_named};
 use tiltak::position::{ExpMove, Komi, Move, Piece, Position, Role};
@@ -43,6 +43,95 @@ pub fn find_all_from_db<const S: usize>(db_path: &str) {
     println!("Found {} candidates", candidates.len());
 }
 
+pub fn backfill_cataklysm_evals<const S: usize>(db_path: &str) {
+    let stats = Arc::new(Stats::default());
+
+    // Create a new table for storing the puzzle candidates
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS candidate_full_solutions (
+            game_id INTEGER NOT NULL,
+            tps TEXT NOT NULL,
+            solution TEXT NOT NULL,
+            goes_to_road BOOLEAN NOT NULL,
+            pure_recaptures_end_sequence TEXT NOT NULL,
+            trivial_desperado_defense_skipped TEXT,
+            cataklysm_end_position_is_win INTEGER,
+            cataklysm_end_position_pv TEXT,
+            FOREIGN KEY (tps) REFERENCES puzzles(tps)
+        )",
+        [],
+    )
+    .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT candidate_full_solutions.*, puzzles.tinue_length AS root_topaz_tinue_length FROM candidate_full_solutions
+            JOIN games ON candidate_full_solutions.game_id = games.id
+            JOIN puzzles ON candidate_full_solutions.tps = puzzles.tps
+            WHERE NOT goes_to_road AND cataklysm_end_position_is_win IS NULL AND games.size = ?1",
+        )
+        .unwrap();
+    let followups: Vec<TinueLineCandidateRow> = stmt
+        .query_and_then([S], from_row::<TinueLineCandidateRow>)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    println!("Got {} followup candidates", followups.len());
+
+    followups
+        .into_par_iter()
+        .for_each_init(
+            || Connection::open(db_path).unwrap(),
+            |conn, followup| {
+                let position: Position<S> = Position::from_fen(&followup.tps).unwrap();
+                let mut position_clone = position.clone();
+                assert!(followup.cataklysm_end_position_is_win.is_none());
+                assert!(followup.cataklysm_end_position_pv.is_none());
+                assert!(!followup.goes_to_road);
+                for mv in followup
+                    .solution
+                    .split_whitespace()
+                    .map(|mv| Move::from_string(mv).unwrap())
+                {
+                    assert!(position_clone.move_is_legal(mv));
+                    position_clone.do_move(mv);
+                    assert!(position_clone.game_result().is_none());
+                }
+                println!("Analyzing candidate puzzle {}, moves {}",
+                    followup.tps, followup.solution);
+                println!("Running cataklysm search on TPS {}", position_clone.to_fen());
+                let (eval, pv) = cataklysm_search(position_clone, 10, &stats, 1 << 22);
+                println!("Got eval '{}', decisive={}, PV '{}'", eval, eval.is_decisive(), pv);
+
+                let mut stmt = conn
+                    .prepare(
+                        "UPDATE candidate_full_solutions SET cataklysm_end_position_is_win = ?1, cataklysm_end_position_pv = ?2
+                            WHERE tps = ?3 AND solution = ?4",
+                    )
+                    .unwrap();
+
+                let rows_updated = stmt.execute(params!(eval.is_decisive() as u64,
+                              pv,
+                              followup.tps.clone(),
+                              followup.solution.clone()))
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Failed to update puzzle candidate: tps {}: {}",
+                            followup.tps, err
+                        );
+                    });
+                if rows_updated != 1 {
+                    println!(
+                        "Expected to update 1 row for puzzle candidate: tps {}, solution {}, but updated {} rows",
+                        followup.tps, followup.solution, rows_updated
+                    );
+                }
+            }
+        );
+}
+
 fn insert_puzzle_candidate<const S: usize>(
     conn: &Connection,
     game_id: u64,
@@ -55,7 +144,7 @@ fn insert_puzzle_candidate<const S: usize>(
     let mut stmt = conn
         .prepare(
             "INSERT OR IGNORE INTO candidate_full_solutions
-        VALUES (:game_id, :tps, :solution, :goes_to_road, :pure_recaptures_end_sequence, :trivial_desperado_defense_skipped)",
+        VALUES (:game_id, :tps, :solution, :goes_to_road, :pure_recaptures_end_sequence, :trivial_desperado_defense_skipped, :cataklysm_end_position_is_win, :cataklysm_end_position_pv)",
         )
         .unwrap();
 
@@ -620,9 +709,10 @@ pub struct TinueLineCandidateRow {
     pub goes_to_road: bool,
     pub pure_recaptures_end_sequence: String,
     pub trivial_desperado_defense_skipped: Option<String>,
-    pub root_topaz_tinue_length: usize,
     pub cataklysm_end_position_is_win: Option<bool>,
     pub cataklysm_end_position_pv: Option<String>,
+    #[serde(skip_serializing)]
+    pub root_topaz_tinue_length: usize,
 }
 
 impl TinueLineCandidateRow {
