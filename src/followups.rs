@@ -1,3 +1,4 @@
+use core::num;
 use std::{
     collections::HashMap,
     sync::{
@@ -216,16 +217,16 @@ pub fn evaluate_followups<const S: usize>(db_path: &str) {
         })
         .collect();
 
-    // print_candidate_stats(&candidates);
-    println!("Reanalyzing {} candidates", candidates.len());
-    // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
-    let candidates = candidates
-        .into_par_iter()
-        .map(|candidate| candidate.reanalyze(&Stats::default()))
-        .collect::<Vec<_>>();
-    println!("Reanalyzed {} candidates", candidates.len());
-
     print_candidate_stats(&candidates);
+    // println!("Reanalyzing {} candidates", candidates.len());
+    // // Reanalyze all candidates, if we've changed the puzzle analysis since it was written to the database
+    // let candidates = candidates
+    //     .into_par_iter()
+    //     .map(|candidate| candidate.reanalyze(&Stats::default()))
+    //     .collect::<Vec<_>>();
+    // println!("Reanalyzed {} candidates", candidates.len());
+
+    // print_candidate_stats(&candidates);
 }
 
 pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2<S>]) {
@@ -273,6 +274,13 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
                 num_manual_no_road += 1;
             }
         }
+
+        if matches!(
+            puzzle_evaluation,
+            PuzzleCandidateEvaluation::Approve(_) | PuzzleCandidateEvaluation::Deny
+        ) {
+            continue;
+        }
         println!("Position: {}", candidate.position.to_fen());
         println!("Topaz tinue length: {}", candidate.root_topaz_tinue_length);
         for processed_candidate in candidate.solutions.iter() {
@@ -318,10 +326,16 @@ pub fn print_candidate_stats<const S: usize>(candidates: &[TinuePuzzleCandidate2
                     assert!(position.move_is_legal(*mv));
                     position.do_move(*mv);
                 }
-                let (cataklysm_eval, cataklysm_pv) =
-                    cataklysm_search(position, 6, &Stats::default(), 1 << 18);
-                print!(" (Cataklysm: {}, {})", cataklysm_eval, cataklysm_pv);
+                print!(
+                    " (Cataklysm: {}, {})",
+                    processed_candidate.cataklysm_end_position_is_win.unwrap(),
+                    processed_candidate
+                        .cataklysm_end_position_pv
+                        .as_ref()
+                        .unwrap()
+                );
             }
+            print!(", {} ply", processed_candidate.total_ply());
             if puzzle_evaluation == PuzzleCandidateEvaluation::Approve(processed_candidate.clone())
             {
                 print!(" (approved solution)");
@@ -575,6 +589,19 @@ pub fn evaluate_candidate_line<const S: usize>(
     } else if solution.moves.len() * 3 < root_topaz_tinue_length {
         // Deny puzzles where the solution line is much shorter than topaz' root length
         Deny
+    } else if solution.pure_recaptures_end_sequence.is_empty()
+        && (solution.num_moves() < 2
+            && solution
+                .winning_cataklysm_line_length()
+                .is_none_or(|n| n > 3)
+            || solution.num_moves() < 3
+                && solution
+                    .winning_cataklysm_line_length()
+                    .is_none_or(|n| n > 4))
+    {
+        Deny
+    } else if solution.total_ply() + 2 < root_topaz_tinue_length {
+        Deny
     } else {
         ManualReview(solution)
     }
@@ -776,8 +803,45 @@ pub struct TinueLineCandidate<const S: usize> {
 }
 
 impl<const S: usize> TinueLineCandidate<S> {
+    pub fn total_ply(&self) -> usize {
+        let mut num_ply = self.moves.len();
+        if self.goes_to_road {
+            return num_ply;
+        }
+        if !self.pure_recaptures_end_sequence.is_empty() {
+            num_ply += self.pure_recaptures_end_sequence.len();
+            return num_ply;
+        }
+        if self.cataklysm_end_position_is_win.unwrap() {
+            num_ply
+                + self
+                    .cataklysm_end_position_pv
+                    .as_ref()
+                    .unwrap()
+                    .split_whitespace()
+                    .count()
+        } else {
+            // The cataklysm search is run with depth 10, so if it found no win, it must be at least 12 ply out
+            num_ply + 12
+        }
+    }
+
     pub fn num_moves(&self) -> usize {
         self.moves.len() / 2
+    }
+
+    pub fn num_cataklysm_moves(&self) -> Option<usize> {
+        self.cataklysm_end_position_pv
+            .as_ref()
+            .map(|pv| pv.split_whitespace().count().div_ceil(2))
+    }
+
+    pub fn winning_cataklysm_line_length(&self) -> Option<usize> {
+        if self.cataklysm_end_position_is_win != Some(true) {
+            None
+        } else {
+            self.num_cataklysm_moves()
+        }
     }
 
     /// Number of walls/caps placed by the defender in this line
